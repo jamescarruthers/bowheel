@@ -29,7 +29,7 @@ struct RuntimeConfig: Codable, Equatable {
     var invertY = false
     var invertX = false
     var momentum = false
-    var momentumDecay: Double = 0.94
+    var momentumDecay: Double = 0.96
     var idleEndMs: Double = 150
 
     /// Merge from loosely-typed JSON so a file missing keys (or with extras) still loads.
@@ -192,6 +192,10 @@ struct ContentView: View {
             Divider()
             Toggle("Software momentum", isOn: $m.cfg.momentum)
                 .help("Off by default — the dial is a physical flywheel and already free-spins.")
+            if m.cfg.momentum {
+                sliderRow("Glide", value: $m.cfg.momentumDecay, in: 0.90...0.985, step: 0.005,
+                          format: { String(format: "%.0f ms", -1000.0 / 60.0 / log($0)) })
+            }
 
             if needsInputMonitoring {
                 Button("Grant Input Monitoring…") {

@@ -90,11 +90,23 @@ struct Config {
     var invertX = false
 
     /// Software momentum. Off by default: the dial is a free-spinning physical flywheel,
-    /// so it keeps emitting real reports after you let go. Adding synthetic inertia on top
-    /// double-counts and feels floaty.
+    /// so it keeps emitting real reports after you let go.
     var momentum = false
-    var momentumDecay: Double = 0.94
-    var momentumMinPixels: Double = 0.4
+    /// Glide friction, expressed as the fraction of velocity kept per 1/60 s. Applied
+    /// against wall-clock, so it means the same thing at any timer rate.
+    /// 0.94 ~ 260 ms time constant (short), 0.96 ~ 410 ms (trackpad-like), 0.98 ~ 825 ms.
+    var momentumDecay: Double = 0.96
+    /// Glide only starts if the hand-off speed exceeds this (px/s), and stops below
+    /// momentumStop (px/s).
+    var momentumTrigger: Double = 250
+    var momentumStop: Double = 25
+    /// When moving fast, reports arrive every 8 ms, so a gap this long already means the
+    /// dial stopped. Handing off here instead of at idleEndMs removes the visible stall.
+    var momentumHandoffMs: Double = 40
+    /// Constant deceleration (px/s^2) on top of the exponential decay. Pure exponential
+    /// has an endless crawl at the tail; this makes the glide come to a definite stop the
+    /// way a trackpad's does. Negligible at speed, decisive below ~600 px/s.
+    var momentumDrag: Double = 1500
 
     /// Acceleration. Gain applied to each delta as a function of rotation speed:
     ///   gain = min(accelMax, 1 + accel * ((speed - accelStart) / 10)^1.5)
@@ -114,6 +126,7 @@ struct Config {
     var debug = false
     var dryRun = false
     var listOnly = false
+    var simulate = false
 
     /// JSON file of runtime settings, hot-reloaded on change. Written by the menu bar
     /// app. CLI flags are the defaults; the file overrides them.
@@ -165,6 +178,15 @@ func parseArgs() -> Config {
         case "--debug":            c.debug = true
         case "--dry-run":          c.dryRun = true; c.seize = false
         case "--list":             c.listOnly = true; c.seize = false
+        case "--simulate-flick":
+            // Feeds a ramping flick through the real engine with no hardware and posts
+            // nothing. For measuring hand-off gap and velocity continuity.
+            c.simulate = true; c.dryRun = true; c.seize = false; c.momentum = true
+        case "--check-post":
+            // Child-process probe for Accessibility; see checkPostAccess().
+            let ok = CGPreflightPostEventAccess()
+            print(ok ? "granted" : "denied")
+            exit(ok ? 0 : 1)
         case "--check-access":
             // Used by the daemon itself, from a child process. See freshInputMonitoringState().
             let st = inputMonitoringState()
@@ -192,7 +214,7 @@ func parseArgs() -> Config {
               --invert-x              flip horizontal scroll direction
               --momentum              add synthetic inertia after release (off by default;
                                       the dial already free-spins in hardware)
-              --decay <0..1>          momentum decay per frame (default 0.94)
+              --decay <0..1>          glide: velocity kept per 1/60 s (default 0.96; higher = longer)
               --idle-ms <n>           idle gap that ends a gesture (default 150)
               --no-seize              do not grab the device (expect double scrolling)
               --seize                 force seizing even with --dry-run (needs root)
@@ -244,6 +266,7 @@ final class Engine {
         cfg.accel = n.accel; cfg.accelMax = n.accelMax; cfg.accelStart = n.accelStart
         cfg.invertY = n.invertY; cfg.invertX = n.invertX
         cfg.momentum = n.momentum; cfg.momentumDecay = n.momentumDecay
+        cfg.momentumTrigger = n.momentumTrigger
         cfg.idleEndMs = n.idleEndMs
     }
 
@@ -255,9 +278,15 @@ final class Engine {
     private var inGesture = false
     private(set) var lastReportAt: CFAbsoluteTime = 0
 
-    // Velocity estimate, exponentially smoothed, in pixels per report (momentum)
-    private var velY: Double = 0
+    // Recent output deltas with timestamps. Hand-off velocity is measured over the last
+    // 60 ms of wall-clock — an EMA lags a flick that is still speeding up, and a
+    // per-report figure is meaningless once replayed at a different timer rate.
+    private var samples: [(t: CFAbsoluteTime, dy: Double, dx: Double)] = []
+    private var velY: Double = 0      // px/s, only meaningful while gliding
     private var velX: Double = 0
+    private var gliding = false
+    private var lastGlideAt: CFAbsoluteTime = 0
+    private let t0 = CFAbsoluteTimeGetCurrent()
 
     // Rotation speed in detents/sec, exponentially smoothed (acceleration)
     private var speed: Double = 0
@@ -283,7 +312,8 @@ final class Engine {
 
         if cfg.debug {
             let hex = b.map { String(format: "%02x", $0) }.joined(separator: " ")
-            FileHandle.standardError.write("rpt id=\(id) len=\(len) [\(hex)]\n".data(using: .utf8)!)
+            FileHandle.standardError.write(String(format: "rpt %9.1fms id=%d len=%d [%@]\n",
+                (CFAbsoluteTimeGetCurrent() - t0) * 1000, id, len, hex).data(using: .utf8)!)
         }
 
         guard id == 3 || id == 5 else { return }
@@ -332,8 +362,8 @@ final class Engine {
         stopMomentum()
         lastReportAt = now
 
-        velY = velY * 0.7 + dy * 0.3
-        velX = velX * 0.7 + dx * 0.3
+        samples.append((now, dy, dx))
+        if samples.count > 32 { samples.removeFirst(samples.count - 32) }
 
         let posted = emit(dy: dy, dx: dx, phase: inGesture ? .changed : .began, momentum: .none)
         if posted { inGesture = true }
@@ -360,10 +390,13 @@ final class Engine {
         let boundary = (phase == .began || phase == .ended || momentum == .end)
         guard py != 0 || px != 0 || boundary else { return false }
 
-        if cfg.dryRun {
+        // --debug logs every post as well, so a live (non-dry) run can be traced.
+        if cfg.dryRun || cfg.debug {
             FileHandle.standardError.write(
-                "   post dy=\(py) dx=\(px) phase=\(phase) momentum=\(momentum)\n".data(using: .utf8)!)
-            return true
+                String(format: "   %7.1fms post dy=%d dx=%d phase=%@ momentum=%@\n",
+                       (CFAbsoluteTimeGetCurrent() - t0) * 1000, py, px,
+                       String(describing: phase), String(describing: momentum)).data(using: .utf8)!)
+            if cfg.dryRun { return true }
         }
 
         guard let ev = CGEvent(scrollWheelEvent2Source: source,
@@ -382,49 +415,84 @@ final class Engine {
 
     // MARK: Gesture close-out / momentum
 
+    /// Velocity in px/s over the last 60 ms before the final report. Needs a few samples:
+    /// a lone blip is not a flick. Grabbing the dial to stop it shows up here as a run of
+    /// shrinking deltas, so the measured speed is low and no glide starts — which is right.
+    private func handoffVelocity() -> (Double, Double) {
+        guard let last = samples.last else { return (0, 0) }
+        let win = samples.filter { last.t - $0.t <= 0.060 }
+        guard win.count >= 3 else { return (0, 0) }
+        // +8 ms: each sample covers the report interval that preceded it.
+        let span = (last.t - win[0].t) + 0.008
+        return (win.reduce(0) { $0 + $1.dy } / span, win.reduce(0) { $0 + $1.dx } / span)
+    }
+
     /// Called from a repeating timer. Ends the gesture once reports stop arriving.
     func tick() {
         guard inGesture else { return }
         let idleMs = (CFAbsoluteTimeGetCurrent() - lastReportAt) * 1000
-        guard idleMs >= cfg.idleEndMs else { return }
+
+        var (vy, vx) = (0.0, 0.0)
+        var glide = false
+        if cfg.momentum {
+            (vy, vx) = handoffVelocity()
+            glide = max(abs(vy), abs(vx)) >= cfg.momentumTrigger
+        }
+        guard idleMs >= (glide ? cfg.momentumHandoffMs : cfg.idleEndMs) else { return }
 
         inGesture = false
         speed = 0
+        samples.removeAll(keepingCapacity: true)
         emit(dy: 0, dx: 0, phase: .ended, momentum: .none)
 
-        if cfg.momentum, abs(velY) > cfg.momentumMinPixels || abs(velX) > cfg.momentumMinPixels {
+        if glide {
+            velY = vy; velX = vx
             startMomentum()
-        } else {
-            velY = 0; velX = 0
         }
     }
 
     private func startMomentum() {
         var first = true
+        gliding = true
+        lastGlideAt = CFAbsoluteTimeGetCurrent()
         let t = DispatchSource.makeTimerSource(queue: .main)
-        t.schedule(deadline: .now(), repeating: .milliseconds(16))
+        t.schedule(deadline: .now(), repeating: .milliseconds(8), leeway: .milliseconds(1))
         t.setEventHandler { [weak self] in
             guard let self else { return }
-            self.velY *= self.cfg.momentumDecay
-            self.velX *= self.cfg.momentumDecay
+            let now = CFAbsoluteTimeGetCurrent()
+            let dt = min(max(now - self.lastGlideAt, 0.001), 0.05)
+            self.lastGlideAt = now
 
-            if abs(self.velY) < self.cfg.momentumMinPixels && abs(self.velX) < self.cfg.momentumMinPixels {
-                self.emit(dy: 0, dx: 0, phase: .none, momentum: .end)
-                self.velY = 0; self.velX = 0
+            // Distance first at the current speed, then friction — so the very first
+            // frame continues at exactly the hand-off velocity.
+            let dy = self.velY * dt, dx = self.velX * dt
+            let k = pow(self.cfg.momentumDecay, dt * 60.0)
+            self.velY *= k; self.velX *= k
+            let drag = self.cfg.momentumDrag * dt
+            self.velY = abs(self.velY) <= drag ? 0 : self.velY - (self.velY > 0 ? drag : -drag)
+            self.velX = abs(self.velX) <= drag ? 0 : self.velX - (self.velX > 0 ? drag : -drag)
+
+            if max(abs(self.velY), abs(self.velX)) < self.cfg.momentumStop {
                 self.stopMomentum()
                 return
             }
-            self.emit(dy: self.velY, dx: self.velX,
-                      phase: .none, momentum: first ? .begin : .cont)
-            first = false
+            if self.emit(dy: dy, dx: dx, phase: .none, momentum: first ? .begin : .cont) {
+                first = false
+            }
         }
         momentumTimer = t
         t.resume()
     }
 
+    /// Always closes the glide with momentum=end. Touching the dial mid-glide lands here
+    /// too; without the end event apps see a new gesture inside a dangling momentum one.
     private func stopMomentum() {
         momentumTimer?.cancel()
         momentumTimer = nil
+        guard gliding else { return }
+        gliding = false
+        velY = 0; velX = 0
+        emit(dy: 0, dx: 0, phase: .none, momentum: .end)
     }
 
     var reportsSeen: Int { reportCount }
@@ -584,6 +652,7 @@ func applyRuntimeJSON(_ obj: [String: Any], to c: inout Config) {
     if let v = d("accelStart"), v >= 0          { c.accelStart = v }
     if let v = d("idleEndMs"), v >= 20          { c.idleEndMs = v }
     if let v = d("momentumDecay"), v > 0, v < 1 { c.momentumDecay = v }
+    if let v = d("momentumTrigger"), v >= 0     { c.momentumTrigger = v }
     if let v = b("invertY")                     { c.invertY = v }
     if let v = b("invertX")                     { c.invertX = v }
     if let v = b("momentum")                    { c.momentum = v }
@@ -595,6 +664,7 @@ func runtimeJSON(_ c: Config) -> [String: Any] {
         "accel": c.accel, "accelMax": c.accelMax, "accelStart": c.accelStart,
         "invertY": c.invertY, "invertX": c.invertX,
         "momentum": c.momentum, "momentumDecay": c.momentumDecay,
+        "momentumTrigger": c.momentumTrigger,
         "idleEndMs": c.idleEndMs,
     ]
 }
@@ -743,23 +813,37 @@ func checkPostAccess() {
           System Settings > Privacy & Security > Accessibility > enable "bowheel".
           If it is not in the list: click +, press Shift-Cmd-G, enter
           \(CommandLine.arguments[0])
-          then restart the daemon: sudo launchctl kickstart -k system/org.bowheel.daemon
+          It takes effect without a restart.
 
         """.data(using: .utf8)!)
+
+    // The answer above is cached for the life of this process, but the grant itself is
+    // honoured immediately — so without this the status would say "denied" forever while
+    // scrolling works. Re-ask from a fresh child until it flips.
+    let t = Timer(timeInterval: 3.0, repeats: true) { timer in
+        if freshState("--check-post") == "granted" {
+            postState = "granted"
+            FileHandle.standardError.write("bowheel: Accessibility granted\n".data(using: .utf8)!)
+            timer.invalidate()
+        }
+    }
+    RunLoop.main.add(t, forMode: .common)
 }
 
 /// TCC answers are cached per process: once this process has been told "denied", it keeps
 /// hearing "denied" even after the user flips the switch. Polling IOHIDCheckAccess in
 /// place therefore never notices a grant. A short-lived child of the same binary has the
 /// same TCC identity and gets a fresh answer.
-func freshInputMonitoringState() -> String {
+func freshInputMonitoringState() -> String { freshState("--check-access") }
+
+func freshState(_ flag: String) -> String {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
-    p.arguments = ["--check-access"]
+    p.arguments = [flag]
     let pipe = Pipe()
     p.standardOutput = pipe
     p.standardError = FileHandle.nullDevice
-    do { try p.run() } catch { return inputMonitoringState() }
+    do { try p.run() } catch { return "unknown" }
     p.waitUntilExit()
     let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
     let st = out.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -821,6 +905,26 @@ let cfg = parseArgs()
 if cfg.listOnly {
     listDevices(cfg)
     exit(0)
+}
+
+if cfg.simulate {
+    let sim = Engine(cfg: cfg)
+    let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 5)
+    var n = 0
+    let ramp: [Int16] = (0..<40).map { Int16(min(12, 2 + $0 / 3)) }   // 2u -> 12u per 8 ms
+    let feed = DispatchSource.makeTimerSource(queue: .main)
+    feed.schedule(deadline: .now() + 0.05, repeating: .milliseconds(8), leeway: .milliseconds(1))
+    feed.setEventHandler {
+        guard n < ramp.count else { feed.cancel(); return }
+        let w = UInt16(bitPattern: ramp[n]); n += 1
+        buf[0] = 3; buf[1] = UInt8(w & 0xff); buf[2] = UInt8(w >> 8); buf[3] = 0; buf[4] = 0
+        sim.handleReport(id: 3, bytes: buf, len: 5)
+    }
+    feed.resume()
+    let tk = Timer(timeInterval: 0.008, repeats: true) { _ in sim.tick() }
+    RunLoop.main.add(tk, forMode: .common)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { exit(0) }
+    CFRunLoopRun()
 }
 
 let engine = Engine(cfg: cfg)

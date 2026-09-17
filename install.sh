@@ -27,7 +27,7 @@ if [ ! -f "$DIR/config.json" ]; then
   "invertY": false,
   "invertX": false,
   "momentum": false,
-  "momentumDecay": 0.94,
+  "momentumDecay": 0.96,
   "idleEndMs": 150
 }
 JSON
@@ -70,7 +70,6 @@ echo "TWO MORE STEPS — System Settings > Privacy & Security. Root is exempt fr
 echo "  1. Input Monitoring  (to read the dial)"
 echo "  2. Accessibility     (to post scroll events — without it reports flow but nothing scrolls)"
 echo "  In each: enable \"bowheel\". If it is not listed: +, Shift-Cmd-G, /usr/local/bin/bowheel"
-echo "  Then: sudo launchctl kickstart -k system/org.bowheel.daemon"
 if [ -n "$SUDO_USER" ]; then
   sudo -u "$SUDO_USER" open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent" 2>/dev/null || true
 fi

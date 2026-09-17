@@ -65,8 +65,7 @@ from neither:
    ⇧⌘G and enter `/usr/local/bin/bowheel`. The daemon notices the grant within a few
    seconds and restarts itself.
 2. **Accessibility** — to post scroll events. Same pane, **Accessibility** section, same
-   **+** → ⇧⌘G → `/usr/local/bin/bowheel`. Then restart the daemon:
-   `sudo launchctl kickstart -k system/org.bowheel.daemon`
+   **+** → ⇧⌘G → `/usr/local/bin/bowheel`. Takes effect immediately, no restart.
 
 The menu bar app shows red with a button to the right pane while either is missing.
 Finally, add **Bowheel** to System Settings → General → Login Items so the menu bar icon is
@@ -98,7 +97,9 @@ Click the dial icon in the menu bar:
   1, so slow, deliberate turns stay precise; above it the gain ramps toward *Max gain*.
   `gain = min(max, 1 + strength × ((speed − start) / 10)^1.5)` with speed in detents/s.
 - **Software momentum** — off by default. The dial is a physical flywheel and already
-  free-spins; synthetic inertia on top double-counts.
+  free-spins; turn this on if you stop the dial by hand and want the page to coast.
+  **Glide** sets how long (friction time constant). The glide picks up at the speed you were
+  actually going, ~40 ms after the dial stops, and touching the dial cancels it.
 
 Settings are written to `/Library/Application Support/bowheel/config.json` and the daemon
 hot-reloads them within half a second. You can also edit the file directly. Invalid JSON is
@@ -153,6 +154,10 @@ exactly as a real trackpad does.
 | `--seize` | force seizing even with `--dry-run` |
 | `--probe` / `--reset` | read / restore the dial's Resolution Multiplier feature report |
 | `--list` | show matching HID devices |
+| `--simulate-flick` | run a synthetic flick through the engine, no hardware, posts nothing |
+
+`sudo ./trace.sh` captures 25 s of live scrolling with a timestamped log of every report
+and posted event (`trace.log`), then restarts the daemon.
 | `--config <path>` | JSON runtime settings, hot-reloaded |
 
 ## Notes for hackers
