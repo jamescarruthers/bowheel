@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>org.bowheel.daemon</string>
+
+  <!-- Runs as root (LaunchDaemons) so the dial can be seized. Without seizing,
+       macOS also delivers its own 120x-too-fast scroll events alongside ours. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/bowheel</string>
+    <string>--pixels</string>
+    <string>480</string>
+    <string>--config</string>
+    <string>/Library/Application Support/bowheel/config.json</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardErrorPath</key>
+  <string>/var/log/bowheel.log</string>
+  <key>StandardOutPath</key>
+  <string>/var/log/bowheel.log</string>
+</dict>
+</plist>

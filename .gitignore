@@ -1,0 +1,12 @@
+# build artifacts
+/bowheel
+/Bowheel.app/
+
+# captures and logs
+*.log
+
+# macOS
+.DS_Store
+
+# release output
+/dist/
