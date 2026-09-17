@@ -39,9 +39,19 @@ fi
 # by running the installer.
 xattr -dr com.apple.quarantine ./bowheel ./Bowheel.app 2>/dev/null || true
 
+# Only replace the daemon when it actually changed: TCC pins an ad-hoc binary by code
+# hash, so a needless copy of a rebuilt-but-identical file is harmless, but a changed one
+# invalidates the Input Monitoring grant and the user has to re-add it.
+CHANGED=1
+if cmp -s ./bowheel /usr/local/bin/bowheel 2>/dev/null; then CHANGED=0; fi
 install -m 755 ./bowheel /usr/local/bin/bowheel
 install -m 644 ./org.bowheel.daemon.plist /Library/LaunchDaemons/org.bowheel.daemon.plist
 chown root:wheel /Library/LaunchDaemons/org.bowheel.daemon.plist
+
+# Remove the pre-rename daemon if an older install left it behind; two daemons would
+# fight over the seize.
+launchctl bootout system/com.mintylamb.bowheel 2>/dev/null || true
+rm -f /Library/LaunchDaemons/com.mintylamb.bowheel.plist
 
 launchctl bootout system/org.bowheel.daemon 2>/dev/null || true
 launchctl bootstrap system /Library/LaunchDaemons/org.bowheel.daemon.plist
@@ -52,10 +62,15 @@ cp -R ./Bowheel.app /Applications/Bowheel.app
 echo "installed /Applications/Bowheel.app (menu bar). Add it to Login Items to start at login."
 
 echo
-echo "ONE MORE STEP — grant Input Monitoring to the daemon:"
-echo "  System Settings > Privacy & Security > Input Monitoring > enable \"bowheel\""
-echo "  The daemon has registered itself in that list and restarts on its own once ticked."
-echo "  Root is not exempt from this; without it the dial opens fine and stays silent."
+if [ "$CHANGED" = 1 ] && [ -n "$(tail -1 /var/log/bowheel.log 2>/dev/null)" ]; then
+  echo "NOTE: the daemon binary changed. If bowheel is already in the privacy lists below,"
+  echo "      remove it (-) and add it again (+) in BOTH — old grants are pinned to the old build."
+fi
+echo "TWO MORE STEPS — System Settings > Privacy & Security. Root is exempt from neither."
+echo "  1. Input Monitoring  (to read the dial)"
+echo "  2. Accessibility     (to post scroll events — without it reports flow but nothing scrolls)"
+echo "  In each: enable \"bowheel\". If it is not listed: +, Shift-Cmd-G, /usr/local/bin/bowheel"
+echo "  Then: sudo launchctl kickstart -k system/org.bowheel.daemon"
 if [ -n "$SUDO_USER" ]; then
   sudo -u "$SUDO_USER" open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent" 2>/dev/null || true
 fi

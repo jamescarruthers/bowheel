@@ -165,6 +165,11 @@ func parseArgs() -> Config {
         case "--debug":            c.debug = true
         case "--dry-run":          c.dryRun = true; c.seize = false
         case "--list":             c.listOnly = true; c.seize = false
+        case "--check-access":
+            // Used by the daemon itself, from a child process. See freshInputMonitoringState().
+            let st = inputMonitoringState()
+            print(st)
+            exit(st == "granted" ? 0 : 1)
         case "--config":           c.configPath = nextVal(a)
         case "--status":           c.statusPath = nextVal(a)
         case "--multiplier":       c.multiplier = Int(nextVal(a))
@@ -195,6 +200,7 @@ func parseArgs() -> Config {
               --debug                 print raw reports and decoded deltas
               --config <path>         JSON runtime settings, hot-reloaded (GUI writes this)
               --status <path>         where to publish live status JSON (default: beside config)
+              --check-access          print Input Monitoring state (granted/denied/unknown) and exit
               --list                  list matching HID devices and exit
               --probe                 read feature report 2 (resolution multiplier) and exit
               --reset                 restore the factory multiplier ([02 05]) and exit
@@ -677,6 +683,7 @@ final class StatusWriter {
             "seized": engine.cfg.seize,
             "reports": engine.reportsSeen,
             "inputMonitoring": tccState,
+            "accessibility": postState,
             "config": runtimeJSON(engine.cfg),
         ]
         if let a = ago { obj["lastReportAgo"] = a }
@@ -713,21 +720,69 @@ func inputMonitoringState() -> String {
     }
 }
 
-func startInputMonitoringWatch() {
+/// Must run BEFORE the device is opened: with seize requested, the open itself fails
+/// with kIOReturnNotPermitted when access is missing, so anything after it never runs
+/// and the binary never registers in the Input Monitoring list. Returns true if access
+/// is already granted; otherwise registers, schedules the poll, and the caller should
+/// skip opening the device and just park in the run loop.
+/// Second TCC gate, on the output side: posting synthetic events needs Accessibility
+/// (kTCCServicePostEvent). Without it CGEvent.post succeeds and the event is silently
+/// dropped. Runs started from a terminal inherit the terminal's grant, which hides the
+/// problem until the binary runs under launchd with its own identity.
+var postState = "unknown"
+
+func checkPostAccess() {
+    if CGPreflightPostEventAccess() {
+        postState = "granted"
+        return
+    }
+    postState = "denied"
+    _ = CGRequestPostEventAccess()   // registers the binary in the Accessibility list
+    FileHandle.standardError.write("""
+        bowheel: Accessibility is NOT granted — reports are read but scroll events are dropped.
+          System Settings > Privacy & Security > Accessibility > enable "bowheel".
+          If it is not in the list: click +, press Shift-Cmd-G, enter
+          \(CommandLine.arguments[0])
+          then restart the daemon: sudo launchctl kickstart -k system/org.bowheel.daemon
+
+        """.data(using: .utf8)!)
+}
+
+/// TCC answers are cached per process: once this process has been told "denied", it keeps
+/// hearing "denied" even after the user flips the switch. Polling IOHIDCheckAccess in
+/// place therefore never notices a grant. A short-lived child of the same binary has the
+/// same TCC identity and gets a fresh answer.
+func freshInputMonitoringState() -> String {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+    p.arguments = ["--check-access"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return inputMonitoringState() }
+    p.waitUntilExit()
+    let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    let st = out.trimmingCharacters(in: .whitespacesAndNewlines)
+    return ["granted", "denied", "unknown"].contains(st) ? st : "unknown"
+}
+
+func startInputMonitoringWatch() -> Bool {
     tccState = inputMonitoringState()
     guard tccState != "granted" else {
         FileHandle.standardError.write("bowheel: Input Monitoring granted\n".data(using: .utf8)!)
-        return
+        return true
     }
     _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
     FileHandle.standardError.write("""
         bowheel: Input Monitoring is \(tccState) for this binary — no reports will arrive until it is.
-          System Settings > Privacy & Security > Input Monitoring > enable "bowheel"
-          (it has just registered itself in that list). Waiting; will restart once granted.
+          System Settings > Privacy & Security > Input Monitoring > enable "bowheel".
+          If it is not in the list, add it by hand: click +, press Shift-Cmd-G, enter
+          \(CommandLine.arguments[0])
+          Waiting; will restart once granted.
 
         """.data(using: .utf8)!)
     let t = Timer(timeInterval: 3.0, repeats: true) { _ in
-        let now = inputMonitoringState()
+        let now = freshInputMonitoringState()
         if now != tccState {
             tccState = now
             FileHandle.standardError.write("bowheel: Input Monitoring now \(now)\n".data(using: .utf8)!)
@@ -738,6 +793,7 @@ func startInputMonitoringWatch() {
         }
     }
     RunLoop.main.add(t, forMode: .common)
+    return false
 }
 
 // MARK: - Device listing
@@ -769,9 +825,13 @@ if cfg.listOnly {
 
 let engine = Engine(cfg: cfg)
 let watcher = DialWatcher(cfg: cfg, engine: engine)
-watcher.start()
 
-startInputMonitoringWatch()
+// Probe/reset only touch feature reports, which are not TCC-gated.
+let hasAccess = cfg.resetOnly ? true : startInputMonitoringWatch()
+if hasAccess {
+    watcher.start()
+}
+if !cfg.dryRun && !cfg.resetOnly { checkPostAccess() }
 
 var configWatcher: ConfigWatcher? = nil
 if let cp = cfg.configPath {

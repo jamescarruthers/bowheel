@@ -57,16 +57,28 @@ sudo ./install.sh   # root LaunchDaemon + /Applications/Bowheel.app
 
 `./release.sh 1.0.0` builds both and produces `dist/bowheel-1.0.0.zip` plus a SHA-256.
 
-Then two settings steps:
+Then grant two privacy permissions to the daemon. Both are required, and root is exempt
+from neither:
 
-1. **Input Monitoring.** `install.sh` opens System Settings → Privacy & Security → Input
-   Monitoring; enable **bowheel** there. Root is not exempt from this gate — without it the
-   daemon opens the dial and simply never receives a report. The daemon registers itself in
-   that list on first run and restarts on its own once ticked.
-2. Add **Bowheel** to System Settings → General → Login Items so the menu bar icon is there
-   at every login. The daemon itself starts at boot regardless.
+1. **Input Monitoring** — to read the dial. `install.sh` opens System Settings → Privacy &
+   Security → Input Monitoring; enable **bowheel**. If it isn't listed, click **+**, press
+   ⇧⌘G and enter `/usr/local/bin/bowheel`. The daemon notices the grant within a few
+   seconds and restarts itself.
+2. **Accessibility** — to post scroll events. Same pane, **Accessibility** section, same
+   **+** → ⇧⌘G → `/usr/local/bin/bowheel`. Then restart the daemon:
+   `sudo launchctl kickstart -k system/org.bowheel.daemon`
+
+The menu bar app shows red with a button to the right pane while either is missing.
+Finally, add **Bowheel** to System Settings → General → Login Items so the menu bar icon is
+there at every login. The daemon itself starts at boot regardless.
 
 `sudo ./uninstall.sh` removes everything.
+
+**Upgrading:** the binaries are ad-hoc signed, so macOS identifies the daemon by its exact
+code hash. After installing a new build, Input Monitoring and Accessibility will still
+*show* bowheel as enabled but the grants no longer match. In each list, remove it with
+**−** and add it back with **+** (⇧⌘G → `/usr/local/bin/bowheel`), then
+`sudo launchctl kickstart -k system/org.bowheel.daemon`.
 
 ### Karabiner-Elements
 
@@ -108,16 +120,24 @@ bowheel daemon (root)      ── every 1 s ─────▶  status.json     
         └─ CGEvent scroll, pixel units, IsContinuous=1, phase began→changed→ended
 ```
 
-Three gates all have to be open before the daemon receives anything, and every one of
-them fails *silently* — the device opens, the queue just stays empty:
+Three gates have to be open, and two of them fail silently:
 
-1. **Exclusive access** — nothing else may have the dial seized (Karabiner, above). This
-   one at least reports `kIOReturnExclusiveAccess`.
-2. **Root** — needed to seize the device.
-3. **Input Monitoring (TCC)** — root is not exempt. The daemon checks with
-   `IOHIDCheckAccess`, registers itself with `IOHIDRequestAccess` so it shows up in the
-   System Settings list, and exits once granted so launchd restarts it with access. The
-   menu bar app shows this state in red with a button to the right settings pane.
+1. **Exclusive access** — nothing else may have the dial seized (Karabiner, above). Fails
+   loudly with `kIOReturnExclusiveAccess`.
+2. **Input Monitoring (TCC, input side)** — without it a seizing open fails with
+   `kIOReturnNotPermitted`, and a shared open succeeds but the report queue stays empty
+   forever. The daemon checks *before* opening the device, registers itself with
+   `IOHIDRequestAccess`, and waits. TCC answers are cached per process, so it polls from a
+   short-lived child (`--check-access`) rather than in place, then exits so launchd
+   restarts it with access.
+3. **Accessibility (TCC, output side)** — without it `CGEvent.post` succeeds and the event
+   is silently dropped: reports flow in, nothing scrolls. Checked with
+   `CGPreflightPostEventAccess`. This one hides during development, because a run started
+   from a terminal is charged to the terminal, which usually already has Accessibility. It
+   only bites once the binary runs under launchd with its own identity.
+
+Root is not itself a gate — with Input Monitoring granted, an ordinary user can seize the
+dial. The daemon runs as root only so it starts at boot, before anyone logs in.
 
 Phases matter: browsers (WebKit, Chromium) drop a `changed` stream that never had a `began`,
 while AppKit scroll views don't care. `began` is therefore always posted even at zero delta,

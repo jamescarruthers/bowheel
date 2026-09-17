@@ -58,6 +58,7 @@ struct DaemonStatus {
     var lastReportAgo: Double?
     var configError: String?
     var inputMonitoring = "unknown"
+    var accessibility = "granted"   // absent in older daemons' status; don't cry wolf
 
     init?(_ o: [String: Any]) {
         guard let ts = (o["ts"] as? NSNumber)?.doubleValue else { return nil }
@@ -70,6 +71,7 @@ struct DaemonStatus {
         lastReportAgo = (o["lastReportAgo"] as? NSNumber)?.doubleValue
         configError = o["configError"] as? String
         inputMonitoring = o["inputMonitoring"] as? String ?? "unknown"
+        accessibility = o["accessibility"] as? String ?? "granted"
     }
 }
 
@@ -199,6 +201,14 @@ struct ContentView: View {
                 .help("Enable \"bowheel\" in the list. The daemon restarts itself once granted.")
             }
 
+            if needsAccessibility {
+                Button("Grant Accessibility…") {
+                    NSWorkspace.shared.open(URL(string:
+                        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+                }
+                .help("Enable \"bowheel\" in the list, then restart the daemon.")
+            }
+
             if let e = m.saveError ?? m.status?.configError {
                 Text(e).font(.caption).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
             }
@@ -224,10 +234,14 @@ struct ContentView: View {
         m.alive && m.status?.inputMonitoring != "granted"
     }
 
+    private var needsAccessibility: Bool {
+        m.alive && m.status?.accessibility == "denied"
+    }
+
     private var dot: Color {
         if !m.installed { return .gray }
         if !m.alive { return .red }
-        if needsInputMonitoring { return .red }
+        if needsInputMonitoring || needsAccessibility { return .red }
         return m.status?.attached == true ? .green : .orange
     }
 
@@ -235,6 +249,7 @@ struct ContentView: View {
         if !m.installed { return "not installed — run sudo ./install.sh" }
         guard m.alive, let s = m.status else { return "daemon not running" }
         if needsInputMonitoring { return "Input Monitoring not granted — no scrolling until it is" }
+        if needsAccessibility { return "Accessibility not granted — scroll events are being dropped" }
         if !s.attached { return "dial not connected" }
         let mode = s.seized ? "seized" : "shared"
         if m.rate > 0.5 { return String(format: "%.0f reports / s · %@", m.rate, mode) }
