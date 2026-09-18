@@ -48,6 +48,8 @@ func parseArgs() -> Config {
             // Feeds a ramping flick through the real engine with no hardware and posts
             // nothing. For measuring hand-off gap and velocity continuity.
             c.simulate = true; c.dryRun = true; c.seize = false; c.momentum = true
+        case "--watch":
+            watchScrolls()   // never returns
         case "--check-post":
             // Child-process probe for Accessibility; see checkPostAccess().
             let ok = CGPreflightPostEventAccess()
@@ -90,6 +92,9 @@ func parseArgs() -> Config {
               --config <path>         JSON runtime settings, hot-reloaded (GUI writes this)
               --status <path>         where to publish live status JSON (default: beside config)
               --check-access          print Input Monitoring state (granted/denied/unknown) and exit
+              --watch                 print every scroll event on the system with its CGEvent
+                                      fields (pixels, lines, phase, momentum, source) — what
+                                      apps actually receive, from bowheel or anything else
               --list                  list matching HID devices and exit
               --probe                 read feature report 2 (resolution multiplier) and exit
               --reset                 restore the factory multiplier ([02 05]) and exit
@@ -164,9 +169,7 @@ final class ConfigWatcher {
         }
     }
 
-    private func log(_ s: String) {
-        FileHandle.standardError.write("bowheel: \(s)\n".data(using: .utf8)!)
-    }
+    private func log(_ s: String) { blog(s) }
 }
 
 /// Publishes live state once a second for the GUI. Atomic write, world-readable.
@@ -215,6 +218,48 @@ final class StatusWriter {
             // Status is best-effort; never let it take the daemon down.
         }
     }
+}
+
+// MARK: - Scroll event tap
+
+/// Listens to every scroll-wheel event in the session and prints its fields. This is the
+/// native view scroll-test.html cannot give: browsers hide ScrollPhase and MomentumPhase,
+/// so a page can only infer the glide from timing. Here you see the fields themselves,
+/// on events from bowheel, a trackpad, a mouse, or anything else.
+var watchLast: CFAbsoluteTime = 0   // global: a C callback cannot capture locals
+
+func watchScrolls() {
+    setvbuf(stdout, nil, _IOLBF, 0)   // line-buffered even when piped to a file
+    let mask = CGEventMask(1 << CGEventType.scrollWheel.rawValue)
+    let cb: CGEventTapCallBack = { _, _, ev, _ in
+        let now = CFAbsoluteTimeGetCurrent()
+        let gap = watchLast > 0 ? (now - watchLast) * 1000 : 0
+        watchLast = now
+        let px = ev.getIntegerValueField(.scrollWheelEventPointDeltaAxis1)
+        let ln = ev.getIntegerValueField(.scrollWheelEventDeltaAxis1)
+        let fx = ev.getDoubleValueField(.scrollWheelEventFixedPtDeltaAxis1)
+        let cont = ev.getIntegerValueField(fIsContinuous)
+        let ph = Phase(rawValue: ev.getIntegerValueField(fScrollPhase)).map { "\($0)" } ?? "?"
+        let mo = Momentum(rawValue: ev.getIntegerValueField(fMomentumPhase)).map { "\($0)" } ?? "?"
+        let pid = ev.getIntegerValueField(.eventSourceUnixProcessID)
+        let loc = ev.location
+        print(String(format: "%6.1fms  px=%+5d  lines=%+3d  fixed=%+7.2f  cont=%d  phase=%-8@ momentum=%-5@ pid=%-6d at %.0f,%.0f",
+                     gap, px, ln, fx, cont, ph, mo, pid, loc.x, loc.y))
+        return Unmanaged.passUnretained(ev)
+    }
+    guard let tap = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
+                                      options: .listenOnly, eventsOfInterest: mask,
+                                      callback: cb, userInfo: nil) else {
+        blog("could not create an event tap — this needs Input Monitoring (System Settings > Privacy & Security)")
+        exit(1)
+    }
+    let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+    CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
+    CGEvent.tapEnable(tap: tap, enable: true)
+    print("watching scroll events (Ctrl-C to stop). pid 0 = posted by the system (a real trackpad or wheel).")
+    signal(SIGINT) { _ in exit(0) }
+    CFRunLoopRun()
+    exit(0)
 }
 
 // MARK: - Device listing

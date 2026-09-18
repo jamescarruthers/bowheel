@@ -20,6 +20,21 @@ import Foundation
 import IOKit
 import IOKit.hid
 import CoreGraphics
+import os
+
+// MARK: - Logging
+//
+// Everything of interest goes to the unified log so it can be read back from a machine
+// we don't have a terminal on:   log show --last 1h --predicate 'subsystem == "org.bowheel"'
+// It is mirrored to stderr for the CLI. Per-report --debug output stays stderr-only:
+// at 125 Hz it would swamp the log store.
+
+let oslog = Logger(subsystem: "org.bowheel", category: "engine")
+
+func blog(_ s: String) {
+    oslog.notice("\(s, privacy: .public)")
+    FileHandle.standardError.write("bowheel: \(s)\n".data(using: .utf8)!)
+}
 
 // MARK: - CGEvent scroll fields
 //
@@ -441,7 +456,16 @@ final class DialWatcher {
     private let cfg: Config
     private let engine: Engine
     private var manager: IOHIDManager?
-    private var buffers: [ObjectIdentifier: UnsafeMutablePointer<UInt8>] = [:]
+
+    // The dial speaks USB and Bluetooth LE with the same VID/PID and report layout, so
+    // when it is paired *and* plugged in the HID manager reports two devices. We track
+    // every match but listen to exactly one, preferring USB, and switch as they come
+    // and go — otherwise both streams would feed the engine.
+    private var known: [ObjectIdentifier: IOHIDDevice] = [:]
+    private var active: IOHIDDevice?
+    private var activeBuffer: UnsafeMutablePointer<UInt8>?
+    /// Transport of the device being listened to ("USB", "Bluetooth Low Energy"), for status.
+    private(set) var activeTransport: String?
 
     init(cfg: Config, engine: Engine) {
         self.cfg = cfg
@@ -471,11 +495,11 @@ final class DialWatcher {
         let ctx = Unmanaged.passUnretained(self).toOpaque()
         IOHIDManagerRegisterDeviceMatchingCallback(manager, { ctx, _, _, device in
             guard let ctx else { return }
-            Unmanaged<DialWatcher>.fromOpaque(ctx).takeUnretainedValue().attach(device)
+            Unmanaged<DialWatcher>.fromOpaque(ctx).takeUnretainedValue().appeared(device)
         }, ctx)
         IOHIDManagerRegisterDeviceRemovalCallback(manager, { ctx, _, _, device in
             guard let ctx else { return }
-            Unmanaged<DialWatcher>.fromOpaque(ctx).takeUnretainedValue().detach(device)
+            Unmanaged<DialWatcher>.fromOpaque(ctx).takeUnretainedValue().disappeared(device)
         }, ctx)
 
         IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
@@ -515,7 +539,7 @@ final class DialWatcher {
             if cfg.seize {
                 hint += "Seizing was requested; --no-seize will open shared instead (expect double scrolling).\n"
             }
-            FileHandle.standardError.write(hint.data(using: .utf8)!)
+            blog(hint.replacingOccurrences(of: "bowheel: ", with: ""))
             lastError = hint
             IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
             self.manager = nil
@@ -529,20 +553,58 @@ final class DialWatcher {
     /// Releases the device. Safe to call when not started.
     func stop() {
         guard let m = manager else { return }
-        for (_, buf) in buffers { buf.deallocate() }
-        buffers.removeAll()
-        engine.attached = false
+        unlisten()
+        known.removeAll()
         IOHIDManagerUnscheduleFromRunLoop(m, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         IOHIDManagerClose(m, IOOptionBits(kIOHIDOptionsTypeNone))
         manager = nil
     }
 
-    private func attach(_ device: IOHIDDevice) {
+    private static func transport(_ d: IOHIDDevice) -> String {
+        (IOHIDDeviceGetProperty(d, kIOHIDTransportKey as CFString) as? String) ?? "?"
+    }
+
+    /// Higher wins. USB is wired, lower latency and never sleeps; BLE is the fallback.
+    private static func rank(_ d: IOHIDDevice) -> Int {
+        switch transport(d) {
+        case "USB": return 2
+        case "Bluetooth", "Bluetooth Low Energy": return 1
+        default: return 0
+        }
+    }
+
+    private func appeared(_ device: IOHIDDevice) {
+        known[ObjectIdentifier(device)] = device
+        log("device appeared: \(Self.transport(device))  (\(known.count) present)")
+        select()
+    }
+
+    private func disappeared(_ device: IOHIDDevice) {
+        known.removeValue(forKey: ObjectIdentifier(device))
+        log("device disappeared: \(Self.transport(device))  (\(known.count) present)")
+        if active === device { unlisten() }
+        select()
+    }
+
+    /// Listen to the best-ranked known device; no-op if that is already the active one.
+    private func select() {
+        guard let best = known.values.max(by: { Self.rank($0) < Self.rank($1) }) else {
+            engine.attached = false
+            return
+        }
+        if active === best { return }
+        unlisten()
+        listen(best)
+    }
+
+    private func listen(_ device: IOHIDDevice) {
         let name = (IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String) ?? "?"
         let maxIn = (IOHIDDeviceGetProperty(device, kIOHIDMaxInputReportSizeKey as CFString) as? Int) ?? 64
         let usage = (IOHIDDeviceGetProperty(device, kIOHIDPrimaryUsageKey as CFString) as? Int) ?? -1
 
-        log("attached: \(name)  maxInputReport=\(maxIn) primaryUsage=\(usage)")
+        active = device
+        activeTransport = Self.transport(device)
+        log("listening: \(name) over \(activeTransport!)  maxInputReport=\(maxIn) primaryUsage=\(usage)")
         engine.attached = true
 
         // Resolution Multiplier (report 2, Usage 0x48). macOS never writes this itself,
@@ -583,7 +645,7 @@ final class DialWatcher {
         let cap = max(maxIn, 8)
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: cap)
         buf.initialize(repeating: 0, count: cap)
-        buffers[ObjectIdentifier(device)] = buf
+        activeBuffer = buf
 
         let ctx = Unmanaged.passUnretained(engine).toOpaque()
         IOHIDDeviceRegisterInputReportCallback(device, buf, cap, { ctx, _, _, _, reportID, report, len in
@@ -593,16 +655,19 @@ final class DialWatcher {
         }, ctx)
     }
 
-    private func detach(_ device: IOHIDDevice) {
-        let key = ObjectIdentifier(device)
-        if let buf = buffers.removeValue(forKey: key) { buf.deallocate() }
+    private func unlisten() {
+        guard let d = active else { return }
+        // A nil callback unregisters; the buffer must outlive the registration.
+        IOHIDDeviceRegisterInputReportCallback(d, activeBuffer!, 0, nil, nil)
+        activeBuffer?.deallocate()
+        activeBuffer = nil
+        active = nil
+        activeTransport = nil
         engine.attached = false
-        log("detached")
+        log("stopped listening (\(Self.transport(d)))")
     }
 
-    private func log(_ s: String) {
-        FileHandle.standardError.write("bowheel: \(s)\n".data(using: .utf8)!)
-    }
+    private func log(_ s: String) { blog(s) }
 }
 
 // MARK: - Runtime config file (hot reload) and status file
@@ -678,14 +743,14 @@ func checkPostAccess() {
     }
     postState = "denied"
     _ = CGRequestPostEventAccess()   // registers the binary in the Accessibility list
-    FileHandle.standardError.write("""
-        bowheel: Accessibility is NOT granted — reports are read but scroll events are dropped.
+    blog("""
+        Accessibility is NOT granted — reports are read but scroll events are dropped.
           System Settings > Privacy & Security > Accessibility > enable "bowheel".
           If it is not in the list: click +, press Shift-Cmd-G, enter
           \(CommandLine.arguments[0])
           It takes effect without a restart.
 
-        """.data(using: .utf8)!)
+        """)
 
     // The answer above is cached for the life of this process, but the grant itself is
     // honoured immediately — so without this the status would say "denied" forever while
@@ -693,7 +758,7 @@ func checkPostAccess() {
     let t = Timer(timeInterval: 3.0, repeats: true) { timer in
         if freshState("--check-post") == "granted" {
             postState = "granted"
-            FileHandle.standardError.write("bowheel: Accessibility granted\n".data(using: .utf8)!)
+            blog("Accessibility granted")
             timer.invalidate()
         }
     }
@@ -723,26 +788,26 @@ func freshState(_ flag: String) -> String {
 func startInputMonitoringWatch() -> Bool {
     tccState = inputMonitoringState()
     guard tccState != "granted" else {
-        FileHandle.standardError.write("bowheel: Input Monitoring granted\n".data(using: .utf8)!)
+        blog("Input Monitoring granted")
         return true
     }
     _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
-    FileHandle.standardError.write("""
-        bowheel: Input Monitoring is \(tccState) for this binary — no reports will arrive until it is.
+    blog("""
+        Input Monitoring is \(tccState) for this binary — no reports will arrive until it is.
           System Settings > Privacy & Security > Input Monitoring > enable "bowheel".
           If it is not in the list, add it by hand: click +, press Shift-Cmd-G, enter
           \(CommandLine.arguments[0])
           Waiting; will restart once granted.
 
-        """.data(using: .utf8)!)
+        """)
     let t = Timer(timeInterval: 3.0, repeats: true) { _ in
         let now = freshInputMonitoringState()
         if now != tccState {
             tccState = now
-            FileHandle.standardError.write("bowheel: Input Monitoring now \(now)\n".data(using: .utf8)!)
+            blog("Input Monitoring now \(now)")
         }
         if now == "granted" {
-            FileHandle.standardError.write("bowheel: Input Monitoring granted — restarting\n".data(using: .utf8)!)
+            blog("Input Monitoring granted — restarting")
             onInputMonitoringGranted()
         }
     }

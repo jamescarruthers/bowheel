@@ -11,6 +11,9 @@ import SwiftUI
 import AppKit
 import ServiceManagement
 import IOKit.hid
+import os
+
+let applog = Logger(subsystem: "org.bowheel", category: "app")
 
 // MARK: - Settings
 
@@ -59,8 +62,11 @@ final class Model: ObservableObject {
     }
 
     @Published var settings = Settings.load() { didSet { settings.save(); push() } }
-    @Published var state: State = .waitingForDevice
+    @Published var state: State = .waitingForDevice {
+        didSet { if state != oldValue { applog.notice("state: \(String(describing: self.state), privacy: .public)") } }
+    }
     @Published var rate: Double = 0
+    @Published var transport: String?
     @Published var loginItem = SMAppService.mainApp.status == .enabled
 
     private let engine: Engine
@@ -134,6 +140,7 @@ final class Model: ObservableObject {
     func relaunch() {
         guard !relaunching else { return }
         relaunching = true
+        applog.notice("both permissions granted — relaunching")
         let bundle = Bundle.main.bundlePath
         let sh = Process()
         sh.executableURL = URL(fileURLWithPath: "/bin/sh")
@@ -167,6 +174,7 @@ final class Model: ObservableObject {
         if case .blocked = state { return }
         if case .failed = state { return }
         state = engine.attached ? .running : .waitingForDevice
+        transport = watcher.activeTransport
 
         let now = Date()
         let dt = now.timeIntervalSince(lastRate)
@@ -181,7 +189,7 @@ final class Model: ObservableObject {
         do {
             if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
         } catch {
-            NSLog("login item: \(error)")
+            applog.error("login item: \(error.localizedDescription, privacy: .public)")
         }
         loginItem = SMAppService.mainApp.status == .enabled
     }
@@ -309,7 +317,8 @@ struct MenuView: View {
     private var subtitle: String {
         switch m.state {
         case .running:
-            return m.rate > 0.5 ? String(format: "%.0f reports / s", m.rate) : "ready"
+            let t = m.transport.map { $0 == "USB" ? "USB" : "Bluetooth" } ?? ""
+            return m.rate > 0.5 ? String(format: "%.0f reports / s · %@", m.rate, t) : "ready · \(t)"
         case .waitingForDevice: return "dial not connected"
         case .needsPermissions(let im, let ax):
             var need: [String] = []

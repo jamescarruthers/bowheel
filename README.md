@@ -142,15 +142,40 @@ process can hold the dial.
 | `--debug` | same, while scrolling for real |
 | `--simulate-flick` | run a synthetic flick through the engine, no hardware, posts nothing |
 | `--probe` / `--reset` | read / restore the dial's Resolution Multiplier feature report |
+| `--watch` | print every scroll event on the system with its CGEvent fields — pixels, lines, phase, momentum, posting pid — whether from bowheel, a trackpad or a mouse |
 | `--list` | show matching HID devices |
 | `--config <path>` | headless mode with a hot-reloaded JSON settings file |
 
 `./trace.sh` captures 25 s of live scrolling with a timestamped log of every report and
 posted event (`trace.log`), then relaunches the app.
 
+`--watch` is the native counterpart of `scroll-test.html`: browsers hide the phase and
+momentum fields, the tap shows them on the actual events.
+
 `scroll-test.html` (open it in a browser) lists every `wheel` event with its pixel delta
 and the gap since the previous one, and graphs them — the quickest way to see the phase
 sequence, acceleration and glide actually arriving in a page.
+
+## Logs
+
+Everything of interest goes to the unified log under subsystem `org.bowheel` (categories
+`app` and `engine`): permission state, device appear/disappear and which transport is
+being listened to, open failures with their `IOReturn`, and settings changes.
+
+```sh
+/usr/bin/log show --last 1h --predicate 'subsystem == "org.bowheel"' --style compact
+```
+
+(`/usr/bin/log` because zsh has a builtin `log` that shadows it.) That's the thing to ask for when it misbehaves on a machine you can't sit at. Per-report
+`--debug` output is deliberately kept out of it.
+
+## Bluetooth
+
+The dial speaks USB and Bluetooth LE with the same VID/PID and report layout. Bowheel
+tracks every matching device but listens to one at a time, preferring USB, and switches
+as they come and go — so a dial that is paired *and* plugged in doesn't feed two streams.
+The status line shows which transport is live. The Bluetooth path is written to the
+same code and untested: this dial has only ever been on USB here.
 
 ## Notes for hackers
 
