@@ -243,6 +243,10 @@ final class Engine {
     init(cfg: Config) {
         self.cfg = cfg
         self.source = CGEventSource(stateID: .hidSystemState)
+        // Posting synthetic events can suppress hardware input from the same source for a
+        // short interval afterwards; at 125 posts/s that would matter. Zero it. (The old
+        // global that also covered cursor warps no longer exists in macOS.)
+        source?.localEventsSuppressionInterval = 0
     }
 
     // MARK: Report decode
@@ -357,13 +361,17 @@ final class Engine {
         ev.setIntegerValueField(fMomentumPhase, value: momentum.rawValue)
 
         // At the HID tap the system fills in the cursor location and routes to the window
-        // under it. For the focused window we hand the event straight to that window's
-        // process instead: anything that goes through WindowServer with a location is
-        // treated as real input and warps the cursor there, which postToPid does not.
-        // The app still uses the location to pick the view under it.
+        // under it. For the focused window the event has to go through WindowServer with
+        // a location inside that window (postToPid delivers but never scrolls, window-
+        // number fields don't redirect, and disassociating the cursor doesn't stop the
+        // warp — all measured). WindowServer treats a located event as real input and
+        // warps the cursor there, so warp it straight back: both are processed in order
+        // well inside one frame and the cursor is never drawn at the centre.
         if cfg.focusedWindow, let t = frontmostWindow() {
+            let cursor = CGEvent(source: nil)?.location
             ev.location = t.centre
-            ev.postToPid(t.pid)
+            ev.post(tap: .cgSessionEventTap)
+            if let c = cursor { CGWarpMouseCursorPosition(c) }
         } else {
             ev.post(tap: .cghidEventTap)
         }

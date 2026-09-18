@@ -84,9 +84,10 @@ Click the dial icon in the menu bar:
 - **Invert direction**
 - **Scroll the focused window** — off: the dial scrolls whatever is under the cursor, like
   a real wheel (events go in at the HID tap and macOS routes them). On: it scrolls the
-  window you're working in wherever the mouse is parked (events are delivered straight to
-  the frontmost window's process with `postToPid`, located inside that window — anything
-  that goes through WindowServer with a location would warp the cursor there).
+  window you're working in wherever the mouse is parked. Events are posted at the session
+  tap located inside the frontmost window, and because WindowServer warps the cursor to any
+  located event, the cursor is warped straight back — both happen inside one frame, so it
+  never visibly moves. (`postToPid` was tried first: it delivers but never scrolls.)
 - **Acceleration** — gain rises with rotation speed. Below *Kicks in at* the gain is exactly
   1, so slow, deliberate turns stay precise; above it the gain ramps toward *Max gain*.
   `gain = min(max, 1 + strength × ((speed − start) / 10)^1.5)` with speed in detents/s.
