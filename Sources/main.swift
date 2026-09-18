@@ -37,6 +37,7 @@ func parseArgs() -> Config {
         case "--decay":            c.momentumDecay = Double(nextVal(a)) ?? c.momentumDecay
         case "--invert":           c.invertY = true
         case "--invert-x":         c.invertX = true
+        case "--focused-window":   c.focusedWindow = true
         case "--momentum":         c.momentum = true
         case "--no-seize":         c.seize = false
         case "--seize":            seizeRequested = true
@@ -77,6 +78,7 @@ func parseArgs() -> Config {
               --accel-start <d/s>     speed in detents/sec where gain starts (default 2.0)
               --invert                flip vertical scroll direction
               --invert-x              flip horizontal scroll direction
+              --focused-window        scroll the frontmost window instead of the one under the cursor
               --momentum              add synthetic inertia after release (off by default;
                                       the dial already free-spins in hardware)
               --decay <0..1>          glide: velocity kept per 1/60 s (default 0.96; higher = longer)

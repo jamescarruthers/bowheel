@@ -89,6 +89,12 @@ struct Config {
     var invertY = false
     var invertX = false
 
+    /// Where the scroll goes. false: post at the HID tap and let macOS route to the window
+    /// under the cursor, like a real wheel. true: post at the session tap with the event
+    /// located inside the frontmost window, so the dial scrolls what you are working in
+    /// regardless of where the mouse is parked.
+    var focusedWindow = false
+
     /// Software momentum. Off by default: the dial is a free-spinning physical flywheel,
     /// so it keeps emitting real reports after you let go.
     var momentum = false
@@ -159,6 +165,7 @@ final class Engine {
         cfg.pixelsPerDetent = n.pixelsPerDetent
         cfg.accel = n.accel; cfg.accelMax = n.accelMax; cfg.accelStart = n.accelStart
         cfg.invertY = n.invertY; cfg.invertX = n.invertX
+        cfg.focusedWindow = n.focusedWindow
         cfg.momentum = n.momentum; cfg.momentumDecay = n.momentumDecay
         cfg.momentumTrigger = n.momentumTrigger
         cfg.idleEndMs = n.idleEndMs
@@ -187,6 +194,33 @@ final class Engine {
 
     private var momentumTimer: DispatchSourceTimer?
     private var reportCount = 0
+
+    // Frontmost window centre, refreshed at most every 100 ms — the window list query is
+    // far too slow to run per report at 125 Hz, and focus does not change that fast.
+    private var focusPoint: CGPoint?
+    private var focusPointAt: CFAbsoluteTime = 0
+
+    /// Centre of the frontmost ordinary window, in CG global coordinates (top-left origin,
+    /// the same space CGEvent.location uses). The on-screen window list comes back
+    /// front-to-back; the first entry at layer 0 is the key window of the active app.
+    /// Menu bar, Dock and floating panels sit at other layers.
+    private func frontmostWindowCentre() -> CGPoint? {
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - focusPointAt < 0.1 { return focusPoint }
+        focusPointAt = now
+        focusPoint = nil
+        let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return nil }
+        for w in list {
+            guard (w[kCGWindowLayer as String] as? Int) == 0,
+                  let b = w[kCGWindowBounds as String] as? [String: CGFloat],
+                  let x = b["X"], let y = b["Y"], let wd = b["Width"], let ht = b["Height"],
+                  wd > 50, ht > 50 else { continue }
+            focusPoint = CGPoint(x: x + wd / 2, y: y + ht / 2)
+            break
+        }
+        return focusPoint
+    }
 
     init(cfg: Config) {
         self.cfg = cfg
@@ -303,7 +337,16 @@ final class Engine {
         ev.setIntegerValueField(fIsContinuous, value: 1)
         ev.setIntegerValueField(fScrollPhase, value: phase.rawValue)
         ev.setIntegerValueField(fMomentumPhase, value: momentum.rawValue)
-        ev.post(tap: .cghidEventTap)
+
+        // At the HID tap the system fills in the cursor location and routes to the window
+        // under it. At the session tap the location is taken as given, so an event placed
+        // inside the frontmost window scrolls that window without moving the cursor.
+        if cfg.focusedWindow, let p = frontmostWindowCentre() {
+            ev.location = p
+            ev.post(tap: .cgSessionEventTap)
+        } else {
+            ev.post(tap: .cghidEventTap)
+        }
         return true
     }
 
@@ -577,6 +620,7 @@ func applyRuntimeJSON(_ obj: [String: Any], to c: inout Config) {
     if let v = d("momentumTrigger"), v >= 0     { c.momentumTrigger = v }
     if let v = b("invertY")                     { c.invertY = v }
     if let v = b("invertX")                     { c.invertX = v }
+    if let v = b("focusedWindow")               { c.focusedWindow = v }
     if let v = b("momentum")                    { c.momentum = v }
 }
 
@@ -584,7 +628,7 @@ func runtimeJSON(_ c: Config) -> [String: Any] {
     [
         "pixelsPerDetent": c.pixelsPerDetent,
         "accel": c.accel, "accelMax": c.accelMax, "accelStart": c.accelStart,
-        "invertY": c.invertY, "invertX": c.invertX,
+        "invertY": c.invertY, "invertX": c.invertX, "focusedWindow": c.focusedWindow,
         "momentum": c.momentum, "momentumDecay": c.momentumDecay,
         "momentumTrigger": c.momentumTrigger,
         "idleEndMs": c.idleEndMs,

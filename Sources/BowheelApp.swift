@@ -21,6 +21,7 @@ struct Settings: Codable, Equatable {
     var accelStart: Double = 2
     var invertY = false
     var invertX = false
+    var focusedWindow = false
     var momentum = false
     var momentumDecay: Double = 0.96
     var idleEndMs: Double = 150
@@ -39,6 +40,7 @@ struct Settings: Codable, Equatable {
         c.pixelsPerDetent = pixelsPerDetent
         c.accel = accel; c.accelMax = accelMax; c.accelStart = accelStart
         c.invertY = invertY; c.invertX = invertX
+        c.focusedWindow = focusedWindow
         c.momentum = momentum; c.momentumDecay = momentumDecay
         c.idleEndMs = idleEndMs
     }
@@ -260,6 +262,8 @@ struct MenuView: View {
 
             slider("Scroll speed", $m.settings.pixelsPerDetent, 20...1000, 10) { String(format: "%.0f px / detent", $0) }
             Toggle("Invert direction", isOn: $m.settings.invertY)
+            Toggle("Scroll the focused window", isOn: $m.settings.focusedWindow)
+                .help("On: scrolls the window you are working in, wherever the mouse is. Off: scrolls whatever is under the cursor, like a real wheel.")
 
             Divider()
             Toggle("Acceleration", isOn: Binding(get: { m.settings.accel > 0 },

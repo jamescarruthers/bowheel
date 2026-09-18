@@ -82,6 +82,10 @@ Click the dial icon in the menu bar:
 
 - **Scroll speed** — pixels per detent
 - **Invert direction**
+- **Scroll the focused window** — off: the dial scrolls whatever is under the cursor, like
+  a real wheel (events go in at the HID tap and macOS routes them). On: it scrolls the
+  window you're working in wherever the mouse is parked (events are posted at the session
+  tap, located inside the frontmost window).
 - **Acceleration** — gain rises with rotation speed. Below *Kicks in at* the gain is exactly
   1, so slow, deliberate turns stay precise; above it the gain ramps toward *Max gain*.
   `gain = min(max, 1 + strength × ((speed − start) / 10)^1.5)` with speed in detents/s.
