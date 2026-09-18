@@ -89,6 +89,9 @@ Click the dial icon in the menu bar:
 - **Acceleration** — gain rises with rotation speed. Below *Kicks in at* the gain is exactly
   1, so slow, deliberate turns stay precise; above it the gain ramps toward *Max gain*.
   `gain = min(max, 1 + strength × ((speed − start) / 10)^1.5)` with speed in detents/s.
+- **Hide menu bar icon** — Bowheel keeps running without an icon (it stays hidden across
+  login too). To get it back, open Bowheel again from Applications or Spotlight: the
+  running copy notices and shows the icon.
 - **Software momentum** — off by default. The dial is a physical flywheel and already
   free-spins; turn this on if you stop the dial by hand and want the page to coast.
   **Glide** sets how long (friction time constant). The glide picks up at the speed you were

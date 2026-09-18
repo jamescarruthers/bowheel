@@ -291,6 +291,16 @@ struct MenuView: View {
 
             Divider()
             Toggle("Start at login", isOn: Binding(get: { m.loginItem }, set: { m.setLoginItem($0) }))
+            HStack {
+                Button("Hide menu bar icon") {
+                    applog.notice("menu bar icon hidden by user")
+                    UserDefaults.standard.set(false, forKey: "menuBarVisible")
+                }
+                Spacer()
+            }
+            Text("Bowheel keeps running. To get the icon back, open Bowheel again from Applications or Spotlight.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
             if case .needsPermissions = m.state {
                 Button("Set up permissions…") { SetupWindow.show(model: m) }
@@ -357,9 +367,23 @@ struct MenuView: View {
 
 // MARK: - App
 
+/// The app is single-instance and hidden from the Dock, so opening it again from
+/// Applications or Spotlight doesn't start a second copy: macOS sends the running one a
+/// reopen. That is the way back once the menu bar icon has been hidden.
+final class ReopenDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        UserDefaults.standard.set(true, forKey: "menuBarVisible")
+        applog.notice("reopened by hand — showing menu bar icon")
+        return false
+    }
+}
+
 @main
 struct BowheelApp: App {
     @StateObject private var model: Model
+    @NSApplicationDelegateAdaptor(ReopenDelegate.self) private var delegate
+    /// Backing store shared with ReopenDelegate; @AppStorage observes the change.
+    @AppStorage("menuBarVisible") private var menuBarVisible = true
 
     init() {
         // Child-process permission probes (see Model.checkPermissionsAndStart). Must run
@@ -377,7 +401,7 @@ struct BowheelApp: App {
     }
 
     var body: some Scene {
-        MenuBarExtra("bowheel", systemImage: "dial.medium") {
+        MenuBarExtra("bowheel", systemImage: "dial.medium", isInserted: $menuBarVisible) {
             MenuView().environmentObject(model)
         }
         .menuBarExtraStyle(.window)
