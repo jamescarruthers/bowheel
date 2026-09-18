@@ -1,0 +1,78 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>bowheel scroll test</title>
+<style>
+  body { font: 13px/1.4 -apple-system, system-ui, sans-serif; margin: 0; display: grid; grid-template-columns: 1fr 340px; height: 100vh; }
+  #page { overflow-y: scroll; padding: 24px; }
+  #page .bar { height: 40px; margin: 6px 0; border-radius: 6px; background: linear-gradient(90deg, #cfe3ff, #e8f0ff); display: flex; align-items: center; padding-left: 12px; color: #345; }
+  #panel { border-left: 1px solid #ddd; padding: 16px; overflow: hidden; display: flex; flex-direction: column; gap: 10px; background: #fafafa; }
+  .stat { display: flex; justify-content: space-between; font-variant-numeric: tabular-nums; }
+  .stat b { font-weight: 600; }
+  #trace { flex: 1; overflow-y: auto; font: 11px/1.35 ui-monospace, monospace; background: #fff; border: 1px solid #ddd; padding: 6px; white-space: pre; }
+  #graph { width: 100%; height: 90px; border: 1px solid #ddd; background: #fff; }
+  button { font: inherit; }
+  small { color: #777; }
+</style>
+
+<div id="page"></div>
+<div id="panel">
+  <div><b>bowheel scroll test</b><br><small>Scroll the left pane with the dial. Every <code>wheel</code> event is listed with its pixel delta and the gap since the previous one.</small></div>
+  <div class="stat"><span>events / s</span><b id="rate">0</b></div>
+  <div class="stat"><span>last deltaY</span><b id="dy">0</b></div>
+  <div class="stat"><span>deltaMode</span><b id="mode">–</b></div>
+  <div class="stat"><span>gap since previous</span><b id="gap">–</b></div>
+  <div class="stat"><span>current burst: events / px / ms</span><b id="burst">–</b></div>
+  <div class="stat"><span>longest tail after last input</span><b id="tail">–</b></div>
+  <canvas id="graph" width="340" height="90"></canvas>
+  <div><button id="clear">Clear</button> <small>deltaMode 0 = pixels (what bowheel sends); 1 = lines (a plain mouse wheel).</small></div>
+  <div id="trace"></div>
+</div>
+
+<script>
+  // Filler so there is something to scroll.
+  const page = document.getElementById('page');
+  for (let i = 1; i <= 400; i++) { const d = document.createElement('div'); d.className = 'bar'; d.textContent = 'row ' + i; page.appendChild(d); }
+
+  const $ = id => document.getElementById(id);
+  const trace = $('trace'), graph = $('graph').getContext('2d');
+  let last = 0, times = [], burst = null, hist = [];
+
+  // A "burst" is a run of events with gaps under 120 ms — one gesture, or one
+  // gesture plus its momentum tail. bowheel's glide shows up as the burst continuing,
+  // with shrinking deltas, after your hand has stopped.
+  page.addEventListener('wheel', e => {
+    const now = performance.now();
+    const gap = last ? now - last : 0;
+    last = now;
+    times.push(now); times = times.filter(t => now - t < 1000);
+
+    if (!burst || gap > 120) burst = { n: 0, px: 0, t0: now };
+    burst.n++; burst.px += e.deltaY; burst.t1 = now;
+
+    $('rate').textContent = times.length;
+    $('dy').textContent = e.deltaY.toFixed(2);
+    $('mode').textContent = e.deltaMode;
+    $('gap').textContent = gap ? gap.toFixed(1) + ' ms' : '–';
+    $('burst').textContent = `${burst.n} / ${burst.px.toFixed(0)} / ${(burst.t1 - burst.t0).toFixed(0)}`;
+
+    hist.push(e.deltaY); if (hist.length > 340) hist.shift();
+    draw();
+
+    const line = `${(now / 1000).toFixed(3)}  dy=${e.deltaY.toFixed(2).padStart(8)}  gap=${gap.toFixed(1).padStart(6)}ms  mode=${e.deltaMode}\n`;
+    trace.textContent += line;
+    if (trace.textContent.length > 40000) trace.textContent = trace.textContent.slice(-30000);
+    trace.scrollTop = trace.scrollHeight;
+  }, { passive: true });
+
+  function draw() {
+    const w = 340, h = 90, mid = h / 2;
+    graph.clearRect(0, 0, w, h);
+    graph.strokeStyle = '#ddd'; graph.beginPath(); graph.moveTo(0, mid); graph.lineTo(w, mid); graph.stroke();
+    const max = Math.max(1, ...hist.map(Math.abs));
+    graph.strokeStyle = '#3a7bd5'; graph.beginPath();
+    hist.forEach((v, i) => { const y = mid - (v / max) * (mid - 4); i ? graph.lineTo(i, y) : graph.moveTo(i, y); });
+    graph.stroke();
+  }
+
+  $('clear').onclick = () => { trace.textContent = ''; hist = []; burst = null; draw(); };
+</script>

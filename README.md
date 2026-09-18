@@ -24,10 +24,7 @@ with the right phases. That is what bowheel does.
 
 ## Requirements
 
-- macOS 14 or later (tested on 26.3)
-- Xcode command line tools (`swiftc`)
-- An admin account (the daemon runs as root; the menu bar app needs `admin` group membership
-  to write the shared config)
+- macOS 14 or later (tested on 26.3), Apple Silicon or Intel
 - If you use Karabiner-Elements: disable the dial there (see below)
 
 ## Install
@@ -38,46 +35,38 @@ Download `bowheel-<version>.zip` from [Releases](../../releases), then:
 
 ```sh
 unzip bowheel-*.zip && cd bowheel-*/
-sudo ./install.sh
+./install.sh
 ```
 
-The binaries are universal (Apple Silicon and Intel) and need macOS 14 or later. They are
-not Developer-ID signed or notarized — `install.sh` clears the download quarantine on the
-files it installs, which is why it needs to be run rather than the app double-clicked out of
-the zip. If you'd rather not run the installer, `xattr -dr com.apple.quarantine` on the
-files does the same thing by hand.
+That copies `Bowheel.app` to `/Applications` and launches it. On first launch macOS asks for
+two permissions and Bowheel shows a setup window that tracks them:
+
+1. **Input Monitoring** — to read the dial
+2. **Accessibility** — to post scroll events
+
+Enable **Bowheel** in each list. It relaunches itself once both are granted. Then turn on
+**Start at login** in its menu.
+
+The app is not notarized (that needs a paid Apple developer account), so a copy downloaded
+through a browser is quarantined and Gatekeeper refuses to open it. `install.sh` clears
+that flag, which is why it exists; `xattr -dr com.apple.quarantine Bowheel.app` does the
+same by hand.
+
+**Upgrading from 0.1.x:** `install.sh` removes the old root daemon (asks for your
+password). The old `bowheel` entries in Input Monitoring and Accessibility can be deleted.
 
 ### From source
 
 ```sh
-./build.sh          # daemon  -> ./bowheel        (universal, macOS >= 14)
-./build-gui.sh      # menu bar app -> ./Bowheel.app
-sudo ./install.sh   # root LaunchDaemon + /Applications/Bowheel.app
+./build-gui.sh      # Bowheel.app   (universal, macOS >= 14)
+./build.sh          # bowheel CLI, for diagnostics
+./install.sh
 ```
 
-`./release.sh 1.0.0` builds both and produces `dist/bowheel-1.0.0.zip` plus a SHA-256.
+`./release.sh <version>` builds both and produces `dist/bowheel-<version>.zip` plus a SHA-256.
 
-Then grant two privacy permissions to the daemon. Both are required, and root is exempt
-from neither:
-
-1. **Input Monitoring** — to read the dial. `install.sh` opens System Settings → Privacy &
-   Security → Input Monitoring; enable **bowheel**. If it isn't listed, click **+**, press
-   ⇧⌘G and enter `/usr/local/bin/bowheel`. The daemon notices the grant within a few
-   seconds and restarts itself.
-2. **Accessibility** — to post scroll events. Same pane, **Accessibility** section, same
-   **+** → ⇧⌘G → `/usr/local/bin/bowheel`. Takes effect immediately, no restart.
-
-The menu bar app shows red with a button to the right pane while either is missing.
-Finally, add **Bowheel** to System Settings → General → Login Items so the menu bar icon is
-there at every login. The daemon itself starts at boot regardless.
-
-`sudo ./uninstall.sh` removes everything.
-
-**Upgrading:** the binaries are ad-hoc signed, so macOS identifies the daemon by its exact
-code hash. After installing a new build, Input Monitoring and Accessibility will still
-*show* bowheel as enabled but the grants no longer match. In each list, remove it with
-**−** and add it back with **+** (⇧⌘G → `/usr/local/bin/bowheel`), then
-`sudo launchctl kickstart -k system/org.bowheel.daemon`.
+**Upgrading a source build:** the app is ad-hoc signed, so every build has a new code
+hash and macOS treats it as a new app: it will ask for both permissions again.
 
 ### Karabiner-Elements
 
@@ -101,44 +90,37 @@ Click the dial icon in the menu bar:
   **Glide** sets how long (friction time constant). The glide picks up at the speed you were
   actually going, ~40 ms after the dial stops, and touching the dial cancels it.
 
-Settings are written to `/Library/Application Support/bowheel/config.json` and the daemon
-hot-reloads them within half a second. You can also edit the file directly. Invalid JSON is
-rejected and the last good settings stay live; the error shows in the menu.
+Settings apply immediately and persist across launches.
 
-The status line shows whether the daemon is up, whether the dial is attached, and reports
-per second while you turn it.
+The status line shows whether the dial is attached, reports per second while you turn it,
+and what is wrong when something is (a missing permission, or another app holding the dial).
 
 ## How it works
 
+Everything runs inside `Bowheel.app`, in your login session — no daemon, no root:
+
 ```
-Bowheel.app  (your user)   ── atomic write ──▶  config.json     ┐
-                                                                 │  root:admin 775
-bowheel daemon (root)      ── every 1 s ─────▶  status.json     ┘
-        │
-        ├─ IOHIDManager, seized, matched on 0xFEED:0xBEEF
-        ├─ report ID 3: [03][wheel lo][wheel hi][pan lo][pan hi]  int16 LE
-        ├─ ÷120 → pixels, × acceleration gain, fractional carry
-        └─ CGEvent scroll, pixel units, IsContinuous=1, phase began→changed→ended
+Bowheel.app
+  ├─ IOHIDManager, seized, matched on 0xFEED:0xBEEF
+  ├─ report ID 3: [03][wheel lo][wheel hi][pan lo][pan hi]  int16 LE
+  ├─ ÷120 → pixels, × acceleration gain, fractional carry
+  └─ CGEvent scroll, pixel units, IsContinuous=1, phase began→changed→ended
 ```
 
-Three gates have to be open, and two of them fail silently:
+Three gates have to be open before it receives anything, and two of them fail *silently*:
 
 1. **Exclusive access** — nothing else may have the dial seized (Karabiner, above). Fails
-   loudly with `kIOReturnExclusiveAccess`.
-2. **Input Monitoring (TCC, input side)** — without it a seizing open fails with
-   `kIOReturnNotPermitted`, and a shared open succeeds but the report queue stays empty
-   forever. The daemon checks *before* opening the device, registers itself with
-   `IOHIDRequestAccess`, and waits. TCC answers are cached per process, so it polls from a
-   short-lived child (`--check-access`) rather than in place, then exits so launchd
-   restarts it with access.
-3. **Accessibility (TCC, output side)** — without it `CGEvent.post` succeeds and the event
-   is silently dropped: reports flow in, nothing scrolls. Checked with
-   `CGPreflightPostEventAccess`. This one hides during development, because a run started
-   from a terminal is charged to the terminal, which usually already has Accessibility. It
-   only bites once the binary runs under launchd with its own identity.
+   loudly with `kIOReturnExclusiveAccess`; the app keeps retrying every 3 s and says so.
+2. **Input Monitoring** — without it a seizing open fails with `kIOReturnNotPermitted`, and
+   a shared open succeeds but the report queue stays empty forever.
+3. **Accessibility** — without it `CGEvent.post` succeeds and the event is silently dropped:
+   reports flow in, nothing scrolls. This one hides during development, because a run
+   started from a terminal is charged to the terminal, which usually already has it.
 
-Root is not itself a gate — with Input Monitoring granted, an ordinary user can seize the
-dial. The daemon runs as root only so it starts at boot, before anyone logs in.
+The app asks for both permissions on first launch (`IOHIDRequestAccess`,
+`AXIsProcessTrustedWithOptions`). macOS caches its answer per process, so the app polls
+from a short-lived child (`--check-access` / `--check-post`) and relaunches once both are
+granted — the HID manager must be opened by a process that had access from the start.
 
 Phases matter: browsers (WebKit, Chromium) drop a `changed` stream that never had a `began`,
 while AppKit scroll views don't care. `began` is therefore always posted even at zero delta,
@@ -146,19 +128,25 @@ exactly as a real trackpad does.
 
 ## Command line
 
-`sudo ./bowheel --help` lists everything. Useful ones:
+`bowheel` is the same engine without the menu bar, for diagnostics. It needs the same two
+permissions; run from Terminal and it borrows Terminal's. Quit Bowheel.app first — only one
+process can hold the dial.
 
 | flag | |
 |---|---|
-| `--debug --dry-run` | print decoded reports, post no events — the first thing to run if it isn't working |
-| `--seize` | force seizing even with `--dry-run` |
+| `--debug --dry-run` | print decoded reports and the events it *would* post; posts nothing |
+| `--debug` | same, while scrolling for real |
+| `--simulate-flick` | run a synthetic flick through the engine, no hardware, posts nothing |
 | `--probe` / `--reset` | read / restore the dial's Resolution Multiplier feature report |
 | `--list` | show matching HID devices |
-| `--simulate-flick` | run a synthetic flick through the engine, no hardware, posts nothing |
+| `--config <path>` | headless mode with a hot-reloaded JSON settings file |
 
-`sudo ./trace.sh` captures 25 s of live scrolling with a timestamped log of every report
-and posted event (`trace.log`), then restarts the daemon.
-| `--config <path>` | JSON runtime settings, hot-reloaded |
+`./trace.sh` captures 25 s of live scrolling with a timestamped log of every report and
+posted event (`trace.log`), then relaunches the app.
+
+`scroll-test.html` (open it in a browser) lists every `wheel` event with its pixel delta
+and the gap since the previous one, and graphs them — the quickest way to see the phase
+sequence, acceleration and glide actually arriving in a page.
 
 ## Notes for hackers
 
@@ -168,8 +156,12 @@ and posted event (`trace.log`), then restarts the daemon.
   at all is opt-in (`--multiplier`) — leave it alone.
 - `IOReturn` is a signed `Int32`; `String(r, radix: 16)` prints garbage like `-1ffffd3b`
   for `0xE00002C5`. `ioReturnName()` decodes it unsigned and names it.
-- The daemon polls `config.json`'s mtime rather than using vnode events because the app
-  writes atomically (temp file + `rename`), which replaces the inode every save.
+- bowheel 0.1.x ran the engine as a root LaunchDaemon with a separate menu bar app talking
+  to it through JSON files. That worked but root is not exempt from either TCC gate, a
+  daemon can't show the permission prompts, and TCC's per-process cache made "granted but
+  still red" a recurring support problem. 0.2 moved the engine into the app — the design
+  [BoDial](https://github.com/IanBullard/BoDial) uses — and the CLI keeps `--config` for
+  anyone who still wants it headless.
 - The device is a composite: CDC-ACM serial on interfaces 0/1 (silent at 115200, with and
   without DTR) and HID on interface 2. Report ID 5 is a plain fallback collection; not seen
   in practice.

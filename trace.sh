@@ -1,16 +1,18 @@
 #!/bin/sh
-# Captures 25 s of live behaviour (real scrolling + full log) for debugging, then puts
-# the daemon back. Run from Terminal:  sudo ./trace.sh [extra bowheel flags]
+# Captures 25 s of live behaviour (real scrolling + a full timestamped log) using the
+# CLI in place of the app, then relaunches the app.  ./trace.sh [extra bowheel flags]
+# The CLI needs Input Monitoring + Accessibility itself; running it from Terminal
+# borrows Terminal's grants.
 set -e
 cd "$(dirname "$0")"
-[ "$(id -u)" -eq 0 ] || { echo "run with sudo" >&2; exit 1; }
-launchctl bootout system/org.bowheel.daemon 2>/dev/null || true
+[ -x ./bowheel ] || ./build.sh
+APP_WAS_RUNNING=0; pgrep -x Bowheel >/dev/null && APP_WAS_RUNNING=1
+pkill -x Bowheel 2>/dev/null || true
 sleep 1
 echo "tracing for 25 s — scroll now"
-./bowheel --debug --status /dev/null "$@" > trace.log 2>&1 &
+./bowheel --debug --pixels 480 --accel 10 --accel-max 6 "$@" > trace.log 2>&1 &
 P=$!
 sleep 25
 kill $P 2>/dev/null || true
-[ -n "$SUDO_USER" ] && chown "$SUDO_USER" trace.log
-launchctl bootstrap system /Library/LaunchDaemons/org.bowheel.daemon.plist 2>/dev/null || true
-echo "done: $(grep -c '^rpt' trace.log) reports in trace.log — daemon restarted"
+[ "$APP_WAS_RUNNING" = 1 ] && open -n /Applications/Bowheel.app 2>/dev/null || true
+echo "done: $(grep -c '^rpt' trace.log) reports in trace.log"
