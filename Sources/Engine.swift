@@ -59,6 +59,29 @@ enum Momentum: Int64 {
 }
 
 
+// MARK: - Cursor-warp input suppression
+//
+// After CGWarpMouseCursorPosition, macOS ignores hardware mouse input for a short interval
+// (250 ms by default). Focused-window mode warps on every report, so the real mouse would
+// stall for as long as the dial turns — which is exactly what users saw. The globals that
+// control this were deprecated in 10.6 and are marked unavailable to Swift, but they are
+// still exported and still honoured, so resolve them at runtime.
+
+private typealias SetInterval = @convention(c) (CFTimeInterval) -> CGError
+private typealias SetFilter   = @convention(c) (UInt32, UInt32) -> CGError
+
+func disableWarpSuppression() {
+    guard let h = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_NOW) else { return }
+    if let p = dlsym(h, "CGSetLocalEventsSuppressionInterval") {
+        _ = unsafeBitCast(p, to: SetInterval.self)(0)
+    }
+    if let p = dlsym(h, "CGSetLocalEventsFilterDuringSuppressionState") {
+        // kCGEventFilterMaskPermitAllEvents (mouse 1 | keyboard 2 | system 4) during
+        // kCGEventSuppressionStateSuppressionInterval (0): belt and braces.
+        _ = unsafeBitCast(p, to: SetFilter.self)(7, 0)
+    }
+}
+
 // MARK: - IOReturn decoding
 //
 // IOReturn is a signed Int32, so String(r, radix: 16) prints nonsense like "-1ffffd3b"
@@ -213,6 +236,7 @@ final class Engine {
     // Frontmost window centre, refreshed at most every 100 ms — the window list query is
     // far too slow to run per report at 125 Hz, and focus does not change that fast.
     private var focusPoint: CGPoint?
+    private var focusBounds = CGRect.zero
     private var focusPid: pid_t = 0
     private var focusPointAt: CFAbsoluteTime = 0
 
@@ -220,9 +244,9 @@ final class Engine {
     /// the same space CGEvent.location uses). The on-screen window list comes back
     /// front-to-back; the first entry at layer 0 is the key window of the active app.
     /// Menu bar, Dock and floating panels sit at other layers.
-    private func frontmostWindow() -> (centre: CGPoint, pid: pid_t)? {
+    private func frontmostWindow() -> (centre: CGPoint, bounds: CGRect, pid: pid_t)? {
         let now = CFAbsoluteTimeGetCurrent()
-        if now - focusPointAt < 0.1 { return focusPoint.map { ($0, focusPid) } }
+        if now - focusPointAt < 0.1 { return focusPoint.map { ($0, focusBounds, focusPid) } }
         focusPointAt = now
         focusPoint = nil
         let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
@@ -234,19 +258,18 @@ final class Engine {
                   let x = b["X"], let y = b["Y"], let wd = b["Width"], let ht = b["Height"],
                   wd > 50, ht > 50 else { continue }
             focusPoint = CGPoint(x: x + wd / 2, y: y + ht / 2)
+            focusBounds = CGRect(x: x, y: y, width: wd, height: ht)
             focusPid = pid
             break
         }
-        return focusPoint.map { ($0, focusPid) }
+        return focusPoint.map { ($0, focusBounds, focusPid) }
     }
 
     init(cfg: Config) {
         self.cfg = cfg
         self.source = CGEventSource(stateID: .hidSystemState)
-        // Posting synthetic events can suppress hardware input from the same source for a
-        // short interval afterwards; at 125 posts/s that would matter. Zero it. (The old
-        // global that also covered cursor warps no longer exists in macOS.)
         source?.localEventsSuppressionInterval = 0
+        disableWarpSuppression()
     }
 
     // MARK: Report decode
@@ -367,12 +390,15 @@ final class Engine {
         // warp — all measured). WindowServer treats a located event as real input and
         // warps the cursor there, so warp it straight back: both are processed in order
         // well inside one frame and the cursor is never drawn at the centre.
-        if cfg.focusedWindow, let t = frontmostWindow() {
-            let cursor = CGEvent(source: nil)?.location
+        if cfg.focusedWindow, let t = frontmostWindow(),
+           let cursor = CGEvent(source: nil)?.location, !t.bounds.contains(cursor) {
+            // Cursor is outside the focused window: relocate the event and warp back.
             ev.location = t.centre
             ev.post(tap: .cgSessionEventTap)
-            if let c = cursor { CGWarpMouseCursorPosition(c) }
+            CGWarpMouseCursorPosition(cursor)
         } else {
+            // Cursor is already over the focused window (it is frontmost, so it is the
+            // window under the cursor) or the mode is off: plain routing, no warp.
             ev.post(tap: .cghidEventTap)
         }
         return true
