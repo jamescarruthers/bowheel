@@ -213,28 +213,31 @@ final class Engine {
     // Frontmost window centre, refreshed at most every 100 ms — the window list query is
     // far too slow to run per report at 125 Hz, and focus does not change that fast.
     private var focusPoint: CGPoint?
+    private var focusPid: pid_t = 0
     private var focusPointAt: CFAbsoluteTime = 0
 
     /// Centre of the frontmost ordinary window, in CG global coordinates (top-left origin,
     /// the same space CGEvent.location uses). The on-screen window list comes back
     /// front-to-back; the first entry at layer 0 is the key window of the active app.
     /// Menu bar, Dock and floating panels sit at other layers.
-    private func frontmostWindowCentre() -> CGPoint? {
+    private func frontmostWindow() -> (centre: CGPoint, pid: pid_t)? {
         let now = CFAbsoluteTimeGetCurrent()
-        if now - focusPointAt < 0.1 { return focusPoint }
+        if now - focusPointAt < 0.1 { return focusPoint.map { ($0, focusPid) } }
         focusPointAt = now
         focusPoint = nil
         let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else { return nil }
         for w in list {
             guard (w[kCGWindowLayer as String] as? Int) == 0,
+                  let pid = w[kCGWindowOwnerPID as String] as? pid_t,
                   let b = w[kCGWindowBounds as String] as? [String: CGFloat],
                   let x = b["X"], let y = b["Y"], let wd = b["Width"], let ht = b["Height"],
                   wd > 50, ht > 50 else { continue }
             focusPoint = CGPoint(x: x + wd / 2, y: y + ht / 2)
+            focusPid = pid
             break
         }
-        return focusPoint
+        return focusPoint.map { ($0, focusPid) }
     }
 
     init(cfg: Config) {
@@ -354,11 +357,13 @@ final class Engine {
         ev.setIntegerValueField(fMomentumPhase, value: momentum.rawValue)
 
         // At the HID tap the system fills in the cursor location and routes to the window
-        // under it. At the session tap the location is taken as given, so an event placed
-        // inside the frontmost window scrolls that window without moving the cursor.
-        if cfg.focusedWindow, let p = frontmostWindowCentre() {
-            ev.location = p
-            ev.post(tap: .cgSessionEventTap)
+        // under it. For the focused window we hand the event straight to that window's
+        // process instead: anything that goes through WindowServer with a location is
+        // treated as real input and warps the cursor there, which postToPid does not.
+        // The app still uses the location to pick the view under it.
+        if cfg.focusedWindow, let t = frontmostWindow() {
+            ev.location = t.centre
+            ev.postToPid(t.pid)
         } else {
             ev.post(tap: .cghidEventTap)
         }
