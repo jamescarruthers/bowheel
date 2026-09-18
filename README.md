@@ -17,7 +17,7 @@ has the device, it re-emits the wheel — but treats each of the 120 units as a 
 you get roughly 120× overspeed.
 
 Fixing the scale is not enough for trackpad feel. Momentum, inertia and rubber-banding on
-macOS are not HID features; they come from private fields on the `CGEvent`
+macOS are not HID features; they come from fields on the `CGEvent` itself
 (`IsContinuous`, `ScrollPhase`, `MomentumPhase`). No HID or DriverKit driver can set them.
 The only real fix is userspace: read the reports, rescale, and post continuous scroll events
 with the right phases. That is what bowheel does.

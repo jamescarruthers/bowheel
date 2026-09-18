@@ -23,11 +23,13 @@ import IOKit
 import IOKit.hid
 import CoreGraphics
 
-// MARK: - Undocumented CGEvent fields
+// MARK: - CGEvent scroll fields
 //
-// These three are the whole trick. They are absent from the public CGEventField enum but
-// are what AppKit reads to decide an event is trackpad-style continuous scroll rather than
-// a notched mouse wheel. Raw values are stable and long-established.
+// These three are the whole trick: AppKit reads them to decide an event is trackpad-style
+// continuous scroll rather than a notched mouse wheel. They are public (CGEventTypes.h:
+// kCGScrollWheelEventIsContinuous = 88, ScrollPhase = 99, MomentumPhase = 123) — the
+// raw values are used only so this compiles against older SDKs where the Swift enum
+// cases were missing.
 
 let fIsContinuous   = CGEventField(rawValue: 88)!   // kCGScrollWheelEventIsContinuous
 let fScrollPhase    = CGEventField(rawValue: 99)!   // kCGScrollWheelEventScrollPhase
