@@ -81,6 +81,7 @@ final class Model: ObservableObject {
         Settings.load().apply(to: &cfg)
         engine = Engine(cfg: cfg)
         watcher = DialWatcher(cfg: cfg, engine: engine)
+        watcher.onError = { [weak self] err in self?.failed(err) }
 
         // Engine clock: closes gestures and runs the glide. 8 ms matches the dial.
         let tick = Timer(timeInterval: 0.008, repeats: true) { [weak self] _ in
@@ -152,21 +153,23 @@ final class Model: ObservableObject {
     // MARK: device
 
     private func start() {
-        if let err = watcher.start() {
-            switch watcher.lastErrorKind {
-            case "exclusive":
-                state = .blocked("Another app has the dial (usually Karabiner-Elements). Retrying…")
-                // Karabiner lets go when the device is unchecked there; keep trying.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.start() }
-            case "permission":
-                // Grant revoked or stale (ad-hoc signing pins the code hash per build).
-                checkPermissionsAndStart()
-            default:
-                state = .failed(err.components(separatedBy: "\n").first ?? err)
-            }
-            return
-        }
+        watcher.start()
         state = engine.attached ? .running : .waitingForDevice
+    }
+
+    /// The watcher seizes each dial as it appears, so failures arrive after start().
+    private func failed(_ err: String) {
+        switch watcher.lastErrorKind {
+        case "exclusive":
+            state = .blocked("Another app has the dial (usually Karabiner-Elements). Retrying…")
+            // Karabiner lets go when the device is unchecked there; keep trying.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.start() }
+        case "permission":
+            // Grant revoked or stale (ad-hoc signing pins the code hash per build).
+            checkPermissionsAndStart()
+        default:
+            state = .failed(err.components(separatedBy: "\n").first ?? err)
+        }
     }
 
     private func refresh() {

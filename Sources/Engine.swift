@@ -17,8 +17,8 @@
 //
 
 import Foundation
-import IOKit
-import IOKit.hid
+import CoreHID
+import IOKit.hid     // Input Monitoring (TCC) checks only; CoreHID has none
 import CoreGraphics
 import os
 
@@ -80,35 +80,6 @@ func disableWarpSuppression() {
         // kCGEventSuppressionStateSuppressionInterval (0): belt and braces.
         _ = unsafeBitCast(p, to: SetFilter.self)(7, 0)
     }
-}
-
-// MARK: - IOReturn decoding
-//
-// IOReturn is a signed Int32, so String(r, radix: 16) prints nonsense like "-1ffffd3b"
-// for what is really 0xE00002C5. Always render it unsigned and name it.
-
-func ioReturnName(_ r: IOReturn) -> String {
-    let u = UInt32(bitPattern: r)
-    let code = u & 0xFFF
-    let names: [UInt32: String] = [
-        0x000: "kIOReturnSuccess",
-        0x2bc: "kIOReturnError",
-        0x2bd: "kIOReturnNoMemory",
-        0x2be: "kIOReturnNoResources",
-        0x2c0: "kIOReturnNoDevice",
-        0x2c1: "kIOReturnNotPrivileged",
-        0x2c2: "kIOReturnBadArgument",
-        0x2c5: "kIOReturnExclusiveAccess",
-        0x2c7: "kIOReturnUnsupported",
-        0x2cd: "kIOReturnNotOpen",
-        0x2d5: "kIOReturnBusy",
-        0x2d6: "kIOReturnTimeout",
-        0x2d9: "kIOReturnNotAttached",
-        0x2e2: "kIOReturnNotPermitted",
-        0x2ed: "kIOReturnNotResponding",
-    ]
-    let name = (u == 0) ? "kIOReturnSuccess" : (names[code] ?? "unknown")
-    return String(format: "0x%08x (%@)", u, name)
 }
 
 // MARK: - Config
@@ -278,15 +249,14 @@ final class Engine {
     ///   ID 3 -> [Wheel int16 LE][AC Pan int16 LE]   (hi-res collection)
     ///   ID 5 -> [Wheel int16 LE][AC Pan int16 LE]   (fallback collection)
     /// Buttons/X/Y (IDs 1 and 4) are deliberately passed through untouched.
-    func handleReport(id: UInt32, bytes: UnsafeMutablePointer<UInt8>, len: Int) {
+    func handleReport(id: UInt32, bytes: [UInt8]) {
         reportCount += 1
-        let buf = UnsafeBufferPointer(start: bytes, count: max(0, len))
-        var b = Array(buf)
+        var b = bytes
 
         if cfg.debug {
             let hex = b.map { String(format: "%02x", $0) }.joined(separator: " ")
             FileHandle.standardError.write(String(format: "rpt %9.1fms id=%d len=%d [%@]\n",
-                (CFAbsoluteTimeGetCurrent() - t0) * 1000, id, len, hex).data(using: .utf8)!)
+                (CFAbsoluteTimeGetCurrent() - t0) * 1000, id, b.count, hex).data(using: .utf8)!)
         }
 
         guard id == 3 || id == 5 else { return }
@@ -490,19 +460,31 @@ final class Engine {
 }
 
 // MARK: - HID plumbing
+//
+// CoreHID (macOS 15+). Device arrival and removal, and input reports, arrive as async
+// streams. Each stream is drained by a main-actor Task, so the engine — which is not
+// thread-safe — only ever runs on the main thread, alongside its timers.
 
 final class DialWatcher {
     private let cfg: Config
     private let engine: Engine
-    private var manager: IOHIDManager?
+    private var managerTask: Task<Void, Never>?
 
     // The dial speaks USB and Bluetooth LE with the same VID/PID and report layout, so
     // when it is paired *and* plugged in the HID manager reports two devices. We track
     // every match but listen to exactly one, preferring USB, and switch as they come
-    // and go — otherwise both streams would feed the engine.
-    private var known: [ObjectIdentifier: IOHIDDevice] = [:]
-    private var active: IOHIDDevice?
-    private var activeBuffer: UnsafeMutablePointer<UInt8>?
+    // and go — otherwise both streams would feed the engine. Every match is seized, not
+    // just the one we listen to: an unseized twin would still feed macOS its own
+    // 120x-too-fast wheel events.
+    private struct Dial {
+        let client: HIDDeviceClient
+        let transport: String
+        let product: String
+        let usage: HIDUsage
+    }
+    private var known: [HIDDeviceClient.DeviceReference: Dial] = [:]
+    private var active: HIDDeviceClient.DeviceReference?
+    private var activeTask: Task<Void, Never>?
     /// Transport of the device being listened to ("USB", "Bluetooth Low Energy"), for status.
     private(set) var activeTransport: String?
 
@@ -513,197 +495,217 @@ final class DialWatcher {
 
     /// Human-readable reason the last start() failed, nil when open.
     private(set) var lastError: String?
-    /// Short machine-readable reason: "exclusive", "permission", "nodevice", "other".
+    /// Short machine-readable reason: "exclusive", "permission", "other".
     private(set) var lastErrorKind: String?
+    /// Called when the dial cannot be opened. CoreHID seizes per device, as each one
+    /// appears, so a failure arrives after start() has returned rather than from it.
+    /// The watcher has already stopped itself when this runs.
+    var onError: (@MainActor (String) -> Void)?
 
-    /// Opens the HID manager. Returns nil on success, otherwise the diagnostic text.
-    @discardableResult
-    func start() -> String? {
+    /// Starts watching for the dial. Failures are reported through onError.
+    func start() {
         stop()
-        let opts: IOOptionBits = cfg.seize ? IOOptionBits(kIOHIDOptionsTypeSeizeDevice)
-                                           : IOOptionBits(kIOHIDOptionsTypeNone)
-        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        self.manager = manager
-
-        let match: [String: Any] = [
-            kIOHIDVendorIDKey as String: cfg.vid,
-            kIOHIDProductIDKey as String: cfg.pid,
-        ]
-        IOHIDManagerSetDeviceMatching(manager, match as CFDictionary)
-
-        let ctx = Unmanaged.passUnretained(self).toOpaque()
-        IOHIDManagerRegisterDeviceMatchingCallback(manager, { ctx, _, _, device in
-            guard let ctx else { return }
-            Unmanaged<DialWatcher>.fromOpaque(ctx).takeUnretainedValue().appeared(device)
-        }, ctx)
-        IOHIDManagerRegisterDeviceRemovalCallback(manager, { ctx, _, _, device in
-            guard let ctx else { return }
-            Unmanaged<DialWatcher>.fromOpaque(ctx).takeUnretainedValue().disappeared(device)
-        }, ctx)
-
-        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-
-        let r = IOHIDManagerOpen(manager, opts)
-        if r != kIOReturnSuccess {
-            let u = UInt32(bitPattern: r) & 0xFFF
-            var hint = "bowheel: could not open the dial — IOReturn \(ioReturnName(r))\n"
-            lastErrorKind = [0x2c5: "exclusive", 0x2c1: "permission", 0x2e2: "permission",
-                             0x2c0: "nodevice", 0x2d9: "nodevice"][u] ?? "other"
-
-            switch u {
-            case 0x2c5:  // kIOReturnExclusiveAccess
-                hint += """
-                        Another process has the device seized exclusively. On this machine that
-                        is almost always Karabiner-Elements. Release it there:
-                          Karabiner-Elements > Settings > Devices > uncheck "Full Scroll Dial"
-                        Scrolling will go dead once Karabiner lets go — macOS ignores this dial's
-                        wheel on its own. That is expected; bowheel takes over from there.
-                        Check the current owner with:
-                          ioreg -c IOHIDDevice -r -l | grep -A80 'Full Scroll Dial' | grep IOUserClientCreator
-
-                        """
-            case 0x2c1, 0x2e2:  // NotPrivileged / NotPermitted
-                hint += """
-                        Permission denied reading input reports. Either run under sudo, or grant
-                        Input Monitoring to this binary:
-                          System Settings > Privacy & Security > Input Monitoring > + > \(CommandLine.arguments[0])
-
-                        """
-            case 0x2c0, 0x2d9:  // NoDevice / NotAttached
-                hint += "Device not attached. Check with: bowheel --list\n"
-            default:
-                hint += "Unexpected failure. Try --list to confirm the device is visible.\n"
-            }
-
-            if cfg.seize {
-                hint += "Seizing was requested; --no-seize will open shared instead (expect double scrolling).\n"
-            }
-            blog(hint.replacingOccurrences(of: "bowheel: ", with: ""))
-            lastError = hint
-            IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-            self.manager = nil
-            return hint
-        }
         lastError = nil
         lastErrorKind = nil
-        return nil
+        let match = HIDDeviceManager.DeviceMatchingCriteria(vendorID: UInt32(cfg.vid),
+                                                            productID: UInt32(cfg.pid))
+        managerTask = Task { @MainActor [weak self] in
+            let manager = HIDDeviceManager()
+            do {
+                for try await n in await manager.monitorNotifications(matchingCriteria: [match]) {
+                    guard let self else { return }
+                    switch n {
+                    case .deviceMatched(let ref): await self.appeared(ref)
+                    case .deviceRemoved(let ref): self.disappeared(ref)
+                    @unknown default: break
+                    }
+                }
+            } catch {
+                if !Task.isCancelled { self?.fail(error) }
+            }
+        }
     }
 
     /// Releases the device. Safe to call when not started.
     func stop() {
-        guard let m = manager else { return }
+        managerTask?.cancel()
+        managerTask = nil
         unlisten()
+        // A seize lasts until its client is deinitialised; dropping ours releases it.
         known.removeAll()
-        IOHIDManagerUnscheduleFromRunLoop(m, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-        IOHIDManagerClose(m, IOOptionBits(kIOHIDOptionsTypeNone))
-        manager = nil
     }
 
-    private static func transport(_ d: IOHIDDevice) -> String {
-        (IOHIDDeviceGetProperty(d, kIOHIDTransportKey as CFString) as? String) ?? "?"
+    private static func name(_ t: HIDDeviceTransport?) -> String {
+        switch t {
+        case .usb?: return "USB"
+        case .bluetooth?: return "Bluetooth"
+        case .bluetoothLowEnergy?: return "Bluetooth Low Energy"
+        case .unknown(let s)?: return s
+        case let t?: return "\(t)"
+        case nil: return "?"
+        }
     }
 
     /// Higher wins. USB is wired, lower latency and never sleeps; BLE is the fallback.
-    private static func rank(_ d: IOHIDDevice) -> Int {
-        switch transport(d) {
+    private static func rank(_ transport: String) -> Int {
+        switch transport {
         case "USB": return 2
         case "Bluetooth", "Bluetooth Low Energy": return 1
         default: return 0
         }
     }
 
-    private func appeared(_ device: IOHIDDevice) {
-        known[ObjectIdentifier(device)] = device
-        log("device appeared: \(Self.transport(device))  (\(known.count) present)")
+    @MainActor
+    private func appeared(_ ref: HIDDeviceClient.DeviceReference) async {
+        guard let client = HIDDeviceClient(deviceReference: ref) else {
+            log("device appeared but could not be opened")
+            return
+        }
+        let transport = Self.name(await client.transport)
+        let product = await client.product ?? "?"
+        let usage = await client.primaryUsage
+        if cfg.seize {
+            // Must happen before any other request on this client.
+            do { try await client.seizeDevice() } catch { fail(error); return }
+        }
+        guard !Task.isCancelled else { return }   // stop() ran while we were waiting
+        known[ref] = Dial(client: client, transport: transport, product: product, usage: usage)
+        log("device appeared: \(transport)  (\(known.count) present)")
         select()
     }
 
-    private func disappeared(_ device: IOHIDDevice) {
-        known.removeValue(forKey: ObjectIdentifier(device))
-        log("device disappeared: \(Self.transport(device))  (\(known.count) present)")
-        if active === device { unlisten() }
+    private func disappeared(_ ref: HIDDeviceClient.DeviceReference) {
+        guard let d = known.removeValue(forKey: ref) else { return }
+        log("device disappeared: \(d.transport)  (\(known.count) present)")
+        if active == ref { unlisten() }
         select()
     }
 
     /// Listen to the best-ranked known device; no-op if that is already the active one.
     private func select() {
-        guard let best = known.values.max(by: { Self.rank($0) < Self.rank($1) }) else {
+        guard let best = known.max(by: { Self.rank($0.value.transport) < Self.rank($1.value.transport) }) else {
             engine.attached = false
             return
         }
-        if active === best { return }
+        if active == best.key { return }
         unlisten()
-        listen(best)
+        listen(best.key, best.value)
     }
 
-    private func listen(_ device: IOHIDDevice) {
-        let name = (IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String) ?? "?"
-        let maxIn = (IOHIDDeviceGetProperty(device, kIOHIDMaxInputReportSizeKey as CFString) as? Int) ?? 64
-        let usage = (IOHIDDeviceGetProperty(device, kIOHIDPrimaryUsageKey as CFString) as? Int) ?? -1
-
-        active = device
-        activeTransport = Self.transport(device)
-        log("listening: \(name) over \(activeTransport!)  maxInputReport=\(maxIn) primaryUsage=\(usage)")
+    private func listen(_ ref: HIDDeviceClient.DeviceReference, _ dial: Dial) {
+        active = ref
+        activeTransport = dial.transport
+        log("listening: \(dial.product) over \(dial.transport)  primaryUsage=\(dial.usage)")
         engine.attached = true
 
-        // Resolution Multiplier (report 2, Usage 0x48). macOS never writes this itself,
-        // which is the root of the scaling problem — but writing it changes device state
-        // and can stop scrolling entirely, so it is opt-in only.
-        if let m = cfg.multiplier {
-            // Feature report 2 is 2 bytes on the wire: [reportID][value]. GetReport
-            // hands back the ID in byte 0, so SetReport expects it there too — passing
-            // a bare 1-byte payload silently writes the wrong field.
-            // value bits: [1:0] = wheel multiplier, [3:2] = AC Pan multiplier.
-            let n = UInt8(clamping: m) & 0x3
-            var buf: [UInt8] = [0x02, n | (n << 2)]
-            let r = IOHIDDeviceSetReport(device, kIOHIDReportTypeFeature, 2, &buf, buf.count)
-            log(r == kIOReturnSuccess
-                ? String(format: "  wrote resolution multiplier = %d (report 2 = [02 %02x])", m, buf[1])
-                : "  FAILED to write feature report 2 — \(ioReturnName(r))")
+        let cfg = self.cfg, engine = self.engine, client = dial.client
+        let report2 = HIDReportID(rawValue: 2)
+        activeTask = Task { @MainActor in
+            // Resolution Multiplier (report 2, Usage 0x48). macOS never writes this itself,
+            // which is the root of the scaling problem — but writing it changes device state
+            // and can stop scrolling entirely, so it is opt-in only.
+            if let m = cfg.multiplier {
+                // Feature report 2 is 2 bytes on the wire: [reportID][value]. GetReport
+                // hands back the ID in byte 0, so SetReport expects it there too — passing
+                // a bare 1-byte payload silently writes the wrong field.
+                // value bits: [1:0] = wheel multiplier, [3:2] = AC Pan multiplier.
+                let n = UInt8(clamping: m) & 0x3
+                let buf: [UInt8] = [0x02, n | (n << 2)]
+                do {
+                    try await client.dispatchSetReportRequest(type: .feature, id: report2,
+                                                              data: Data(buf), timeout: .seconds(1))
+                    blog(String(format: "  wrote resolution multiplier = %d (report 2 = [02 %02x])", m, buf[1]))
+                } catch {
+                    blog("  FAILED to write feature report 2 — \(error)")
+                }
+            }
+
+            // macOS is inconsistent about whether the leading report-ID byte lives in the
+            // buffer, so dump raw bytes and let the hex decide rather than assuming an offset.
+            do {
+                let rb = try await client.dispatchGetReportRequest(type: .feature, id: report2,
+                                                                   timeout: .seconds(1))
+                let hex = rb.map { String(format: "%02x", $0) }.joined(separator: " ")
+                blog("  feature report 2 raw = [\(hex)] len=\(rb.count)")
+            } catch {
+                blog("  could not read feature report 2 — \(error)")
+            }
+
+            if cfg.resetOnly {
+                blog("done. If scrolling is still dead, unplug and replug the dial.")
+                exit(0)
+            }
+
+            do {
+                let stream = await client.monitorNotifications(reportIDsToMonitor: [HIDReportID.allReports],
+                                                               elementsToMonitor: [])
+                for try await n in stream {
+                    switch n {
+                    case .inputReport(let id, let data, _):
+                        engine.handleReport(id: UInt32(id?.rawValue ?? 0), bytes: [UInt8](data))
+                    case .deviceSeized:
+                        blog("another process seized the dial; no reports until it lets go")
+                    case .deviceUnseized:
+                        blog("the other process released the dial")
+                    case .deviceRemoved:
+                        return   // the manager stream does the bookkeeping
+                    case .elementUpdates:
+                        break
+                    @unknown default:
+                        break
+                    }
+                }
+            } catch {
+                if !Task.isCancelled { blog("input report stream ended — \(error)") }
+            }
         }
-
-        // Read with the full report size. macOS is inconsistent about whether the
-        // leading report-ID byte lives in the buffer, so dump raw bytes and let the
-        // hex decide rather than assuming an offset.
-        let fcap = (IOHIDDeviceGetProperty(device, kIOHIDMaxFeatureReportSizeKey as CFString) as? Int) ?? 2
-        var rb = [UInt8](repeating: 0, count: max(fcap, 2))
-        var rbLen: CFIndex = rb.count
-        let gr = IOHIDDeviceGetReport(device, kIOHIDReportTypeFeature, 2, &rb, &rbLen)
-        if gr == kIOReturnSuccess {
-            let hex = rb.prefix(max(Int(rbLen), 1)).map { String(format: "%02x", $0) }.joined(separator: " ")
-            log("  feature report 2 raw = [\(hex)] len=\(rbLen) (cap \(fcap))")
-        } else {
-            log("  could not read feature report 2 — \(ioReturnName(gr))")
-        }
-
-        if cfg.resetOnly {
-            log("done. If scrolling is still dead, unplug and replug the dial.")
-            exit(0)
-        }
-
-        let cap = max(maxIn, 8)
-        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: cap)
-        buf.initialize(repeating: 0, count: cap)
-        activeBuffer = buf
-
-        let ctx = Unmanaged.passUnretained(engine).toOpaque()
-        IOHIDDeviceRegisterInputReportCallback(device, buf, cap, { ctx, _, _, _, reportID, report, len in
-            guard let ctx else { return }
-            Unmanaged<Engine>.fromOpaque(ctx).takeUnretainedValue()
-                .handleReport(id: reportID, bytes: report, len: len)
-        }, ctx)
     }
 
     private func unlisten() {
-        guard let d = active else { return }
-        // A nil callback unregisters; the buffer must outlive the registration.
-        IOHIDDeviceRegisterInputReportCallback(d, activeBuffer!, 0, nil, nil)
-        activeBuffer?.deallocate()
-        activeBuffer = nil
+        guard active != nil else { return }
+        activeTask?.cancel()
+        activeTask = nil
+        log("stopped listening (\(activeTransport ?? "?"))")
         active = nil
         activeTransport = nil
         engine.attached = false
-        log("stopped listening (\(Self.transport(d)))")
+    }
+
+    @MainActor
+    private func fail(_ error: Error) {
+        var hint = "bowheel: could not open the dial — \(error)\n"
+        switch error as? HIDDeviceError {
+        case .exclusiveAccess?:
+            lastErrorKind = "exclusive"
+            hint += """
+                    Another process has the device seized exclusively. On this machine that
+                    is almost always Karabiner-Elements. Release it there:
+                      Karabiner-Elements > Settings > Devices > uncheck "Full Scroll Dial"
+                    Scrolling will go dead once Karabiner lets go — macOS ignores this dial's
+                    wheel on its own. That is expected; bowheel takes over from there.
+                    Check the current owner with:
+                      ioreg -c IOHIDDevice -r -l | grep -A80 'Full Scroll Dial' | grep IOUserClientCreator
+
+                    """
+        case .notPrivileged?, .notPermitted?:
+            lastErrorKind = "permission"
+            hint += """
+                    Permission denied reading input reports. Either run under sudo, or grant
+                    Input Monitoring to this binary:
+                      System Settings > Privacy & Security > Input Monitoring > + > \(CommandLine.arguments[0])
+
+                    """
+        default:
+            lastErrorKind = "other"
+            hint += "Unexpected failure. Try --list to confirm the device is visible.\n"
+        }
+        if cfg.seize {
+            hint += "Seizing was requested; --no-seize will open shared instead (expect double scrolling).\n"
+        }
+        blog(hint.replacingOccurrences(of: "bowheel: ", with: ""))
+        lastError = hint
+        stop()
+        onError?(hint)
     }
 
     private func log(_ s: String) { blog(s) }
@@ -764,8 +766,8 @@ func inputMonitoringState() -> String {
     }
 }
 
-/// Must run BEFORE the device is opened: with seize requested, the open itself fails
-/// with kIOReturnNotPermitted when access is missing, so anything after it never runs
+/// Must run BEFORE the device is opened: with seize requested, seizing fails with
+/// HIDDeviceError.notPermitted when access is missing, so anything after it never runs
 /// and the binary never registers in the Input Monitoring list. Returns true if access
 /// is already granted; otherwise registers, schedules the poll, and the caller should
 /// skip opening the device and just park in the run loop.

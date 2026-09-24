@@ -5,8 +5,7 @@
 //
 
 import Foundation
-import IOKit
-import IOKit.hid
+import CoreHID
 import CoreGraphics
 
 func parseArgs() -> Config {
@@ -264,20 +263,28 @@ func watchScrolls() {
 
 // MARK: - Device listing
 
-func listDevices(_ cfg: Config) {
-    let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-    IOHIDManagerSetDeviceMatching(mgr, nil)
-    IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
-    guard let set = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice> else {
-        print("no devices (Input Monitoring permission?)"); return
+/// CoreHID has no "copy the current devices" call: the matching stream announces every
+/// device already present, then waits for new ones. Collect for a moment, then print.
+@MainActor
+func listDevices(_ cfg: Config) async {
+    let collect = Task { @MainActor () -> [String] in
+        var lines: [String] = []
+        let all = HIDDeviceManager.DeviceMatchingCriteria()
+        do {
+            for try await n in await HIDDeviceManager().monitorNotifications(matchingCriteria: [all]) {
+                guard case .deviceMatched(let ref) = n, let d = HIDDeviceClient(deviceReference: ref) else { continue }
+                let vid = await d.vendorID, pid = await d.productID
+                let name = await d.product ?? "?"
+                let mark = (vid == UInt32(cfg.vid) && pid == UInt32(cfg.pid)) ? "  <== match" : ""
+                lines.append(String(format: "%04x:%04x  %@%@", vid, pid, name, mark))
+            }
+        } catch {}
+        return lines
     }
-    for d in set {
-        let vid = (IOHIDDeviceGetProperty(d, kIOHIDVendorIDKey as CFString) as? Int) ?? 0
-        let pid = (IOHIDDeviceGetProperty(d, kIOHIDProductIDKey as CFString) as? Int) ?? 0
-        let name = (IOHIDDeviceGetProperty(d, kIOHIDProductKey as CFString) as? String) ?? "?"
-        let mark = (vid == cfg.vid && pid == cfg.pid) ? "  <== match" : ""
-        print(String(format: "%04x:%04x  %@%@", vid, pid, name, mark))
-    }
+    try? await Task.sleep(for: .milliseconds(500))
+    collect.cancel()   // ends the stream; the task then returns what it saw
+    let lines = await collect.value
+    print(lines.isEmpty ? "no devices (Input Monitoring permission?)" : lines.joined(separator: "\n"))
 }
 
 // MARK: - main
@@ -285,13 +292,15 @@ func listDevices(_ cfg: Config) {
 let cfg = parseArgs()
 
 if cfg.listOnly {
-    listDevices(cfg)
-    exit(0)
+    Task { @MainActor in
+        await listDevices(cfg)
+        exit(0)
+    }
+    CFRunLoopRun()
 }
 
 if cfg.simulate {
     let sim = Engine(cfg: cfg)
-    let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 5)
     var n = 0
     let ramp: [Int16] = (0..<40).map { Int16(min(12, 2 + $0 / 3)) }   // 2u -> 12u per 8 ms
     let feed = DispatchSource.makeTimerSource(queue: .main)
@@ -299,8 +308,7 @@ if cfg.simulate {
     feed.setEventHandler {
         guard n < ramp.count else { feed.cancel(); return }
         let w = UInt16(bitPattern: ramp[n]); n += 1
-        buf[0] = 3; buf[1] = UInt8(w & 0xff); buf[2] = UInt8(w >> 8); buf[3] = 0; buf[4] = 0
-        sim.handleReport(id: 3, bytes: buf, len: 5)
+        sim.handleReport(id: 3, bytes: [3, UInt8(w & 0xff), UInt8(w >> 8), 0, 0])
     }
     feed.resume()
     let tk = Timer(timeInterval: 0.008, repeats: true) { _ in sim.tick() }
@@ -314,8 +322,9 @@ let watcher = DialWatcher(cfg: cfg, engine: engine)
 
 // Probe/reset only touch feature reports, which are not TCC-gated.
 let hasAccess = cfg.resetOnly ? true : startInputMonitoringWatch()
-if hasAccess, watcher.start() != nil {
-    exit(1)
+if hasAccess {
+    watcher.onError = { _ in exit(1) }   // the watcher has already logged why
+    watcher.start()
 }
 if !cfg.dryRun && !cfg.resetOnly { checkPostAccess() }
 
