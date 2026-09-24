@@ -1,0 +1,29 @@
+# Pushing a tag like v0.3.0 builds dist/bowheel-0.3.0.zip with release.sh and attaches it,
+# plus its .sha256, to a published GitHub Release (notes auto-generated; edit afterwards).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15   # CoreHID needs the macOS 15 SDK
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: ./release.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$V" --generate-notes
+          gh release upload "$GITHUB_REF_NAME" --clobber \
+            "dist/bowheel-$V.zip" "dist/bowheel-$V.zip.sha256"
