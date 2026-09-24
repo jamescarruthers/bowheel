@@ -1,10 +1,10 @@
 #!/bin/sh
 # Assembles Bowheel.app: the engine plus the menu bar UI in one process. Universal,
-# macOS 14+. No Xcode project needed — a bundle is just a directory layout.
+# macOS 15+ (CoreHID). No Xcode project needed — a bundle is just a directory layout.
 set -e
 cd "$(dirname "$0")"
 APP=Bowheel.app
-MIN=14.0
+MIN=15.0
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
 
@@ -30,7 +30,7 @@ PLIST
 for arch in arm64 x86_64; do
   swiftc -O -swift-version 5 -parse-as-library -target "$arch-apple-macos$MIN" \
     -framework SwiftUI -framework AppKit -framework ServiceManagement \
-    -framework IOKit -framework CoreGraphics \
+    -framework CoreHID -framework IOKit -framework CoreGraphics \
     -o "$APP/Contents/MacOS/Bowheel-$arch" Sources/Engine.swift Sources/BowheelApp.swift
 done
 lipo -create -output "$APP/Contents/MacOS/Bowheel" \

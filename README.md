@@ -24,7 +24,7 @@ with the right phases. That is what bowheel does.
 
 ## Requirements
 
-- macOS 14 or later (tested on 26.3), Apple Silicon or Intel
+- macOS 15 or later (tested on 26.3), Apple Silicon or Intel
 - If you use Karabiner-Elements: disable the dial there (see below)
 
 ## Install
@@ -58,7 +58,7 @@ password). The old `bowheel` entries in Input Monitoring and Accessibility can b
 ### From source
 
 ```sh
-./build-gui.sh      # Bowheel.app   (universal, macOS >= 14)
+./build-gui.sh      # Bowheel.app   (universal, macOS >= 15)
 ./build.sh          # bowheel CLI, for diagnostics
 ./install.sh
 ```
@@ -71,7 +71,7 @@ hash and macOS treats it as a new app: it will ask for both permissions again.
 ### Karabiner-Elements
 
 Karabiner seizes pointing devices by default, and while it holds the dial nothing else can
-open it (`kIOReturnExclusiveAccess`). In Karabiner-Elements → Settings → Devices, untick
+open it (`HIDDeviceError.exclusiveAccess`). In Karabiner-Elements → Settings → Devices, untick
 **Full Scroll Dial**. Scrolling goes dead at that moment — expected, since macOS ignores the
 dial natively — and bowheel takes over from there. Karabiner keeps working for everything
 else.
@@ -110,7 +110,7 @@ Everything runs inside `Bowheel.app`, in your login session — no daemon, no ro
 
 ```
 Bowheel.app
-  ├─ IOHIDManager, seized, matched on 0xFEED:0xBEEF
+  ├─ CoreHID HIDDeviceManager, seized, matched on 0xFEED:0xBEEF
   ├─ report ID 3: [03][wheel lo][wheel hi][pan lo][pan hi]  int16 LE
   ├─ ÷120 → pixels, × acceleration gain, fractional carry
   └─ CGEvent scroll, pixel units, IsContinuous=1, phase began→changed→ended
@@ -119,8 +119,8 @@ Bowheel.app
 Three gates have to be open before it receives anything, and two of them fail *silently*:
 
 1. **Exclusive access** — nothing else may have the dial seized (Karabiner, above). Fails
-   loudly with `kIOReturnExclusiveAccess`; the app keeps retrying every 3 s and says so.
-2. **Input Monitoring** — without it a seizing open fails with `kIOReturnNotPermitted`, and
+   loudly with `HIDDeviceError.exclusiveAccess`; the app keeps retrying every 3 s and says so.
+2. **Input Monitoring** — without it seizing fails with `HIDDeviceError.notPermitted`, and
    a shared open succeeds but the report queue stays empty forever.
 3. **Accessibility** — without it `CGEvent.post` succeeds and the event is silently dropped:
    reports flow in, nothing scrolls. This one hides during development, because a run
